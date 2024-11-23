@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Install and build ruby using ruby-install
+# this test is super slow and we're already testing ruby-build, so skipping for now
 
-export MISE_RUBY_INSTALL=1
-assert_contains "mise x ruby@3.2.1 -- ruby --version" "ruby 3.2.1"
+#export MISE_RUBY_INSTALL=1
+#latest=$(mise latest ruby)
+#assert_contains "mise x ruby@$latest -- ruby --version" "ruby $latest"

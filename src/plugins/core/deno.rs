@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use contracts::requires;
 use eyre::Result;
 use itertools::Itertools;
 use serde::Deserialize;
@@ -56,7 +55,7 @@ impl DenoPlugin {
         let filename = url.split('/').last().unwrap();
         let tarball_path = tv.download_path().join(filename);
 
-        pr.set_message(format!("downloading {filename}"));
+        pr.set_message(format!("download {filename}"));
         HTTP.download_file(&url, &tarball_path, Some(pr))?;
 
         // TODO: hash::ensure_checksum_sha256(&tarball_path, &m.sha256)?;
@@ -66,7 +65,7 @@ impl DenoPlugin {
 
     fn install(&self, tv: &ToolVersion, pr: &dyn SingleReport, tarball_path: &Path) -> Result<()> {
         let filename = tarball_path.file_name().unwrap().to_string_lossy();
-        pr.set_message(format!("installing {filename}"));
+        pr.set_message(format!("extract {filename}"));
         file::remove_all(tv.install_path())?;
         file::create_dir_all(tv.install_path().join("bin"))?;
         file::unzip(tarball_path, &tv.download_path())?;
@@ -109,17 +108,21 @@ impl Backend for DenoPlugin {
         Ok(vec![".deno-version".into()])
     }
 
-    #[requires(matches!(ctx.tv.request, ToolRequest::Version { .. } | ToolRequest::Prefix { .. }), "unsupported tool version request type")]
-    fn install_version_impl(&self, ctx: &InstallContext) -> Result<()> {
-        let tarball_path = self.download(&ctx.tv, ctx.pr.as_ref())?;
-        self.install(&ctx.tv, ctx.pr.as_ref(), &tarball_path)?;
-        self.verify(&ctx.tv, ctx.pr.as_ref())?;
+    fn install_version_impl(
+        &self,
+        ctx: &InstallContext,
+        mut tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
+        let tarball_path = self.download(&tv, ctx.pr.as_ref())?;
+        self.verify_checksum(ctx, &mut tv, &tarball_path)?;
+        self.install(&tv, ctx.pr.as_ref(), &tarball_path)?;
+        self.verify(&tv, ctx.pr.as_ref())?;
 
-        Ok(())
+        Ok(tv)
     }
 
     fn list_bin_paths(&self, tv: &ToolVersion) -> Result<Vec<PathBuf>> {
-        if let ToolRequest::System(..) = tv.request {
+        if let ToolRequest::System { .. } = tv.request {
             return Ok(vec![]);
         }
         let bin_paths = vec![

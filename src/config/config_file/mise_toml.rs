@@ -15,12 +15,12 @@ use versions::Versioning;
 
 use crate::cli::args::{BackendArg, ToolVersionType};
 use crate::config::config_file::toml::{deserialize_arr, deserialize_path_entry_arr};
-use crate::config::config_file::{trust_check, ConfigFile, TaskConfig};
+use crate::config::config_file::{trust, trust_check, ConfigFile, TaskConfig};
 use crate::config::env_directive::{EnvDirective, PathEntry};
 use crate::config::settings::SettingsPartial;
 use crate::config::{Alias, AliasMap};
 use crate::file::{create_dir_all, display_path};
-use crate::registry::REGISTRY_BACKEND_MAP;
+use crate::registry::REGISTRY;
 use crate::task::Task;
 use crate::tera::{get_tera, BASE_CONTEXT};
 use crate::toolset::{ToolRequest, ToolRequestSet, ToolSource, ToolVersionOptions};
@@ -53,6 +53,8 @@ pub struct MiseToml {
     #[serde(default)]
     tasks: Tasks,
     #[serde(default)]
+    vars: IndexMap<String, String>,
+    #[serde(default)]
     settings: SettingsPartial,
 }
 
@@ -62,6 +64,7 @@ pub struct MiseTomlToolList(Vec<MiseTomlTool>);
 #[derive(Debug, Clone)]
 pub struct MiseTomlTool {
     pub tt: ToolVersionType,
+    pub os: Option<Vec<String>>,
     pub options: Option<ToolVersionOptions>,
 }
 
@@ -88,6 +91,7 @@ impl MiseToml {
     }
 
     pub fn from_str(body: &str, path: &Path) -> eyre::Result<Self> {
+        trust_check(path)?;
         trace!("parsing: {}", display_path(path));
         let des = toml::Deserializer::new(body);
         let mut rf: MiseToml = serde_ignored::deserialize(des, |p| {
@@ -201,7 +205,6 @@ impl MiseToml {
         if !input.contains("{{") && !input.contains("{%") && !input.contains("{#") {
             return Ok(input.to_string());
         }
-        trust_check(&self.path)?;
         let dir = self.path.parent();
         let output = get_tera(dir)
             .render_str(input, &self.context)
@@ -267,9 +270,6 @@ impl ConfigFile for MiseToml {
             .chain(env_files)
             .chain(env_entries)
             .collect::<Vec<_>>();
-        if !all.is_empty() {
-            trust_check(&self.path)?;
-        }
         Ok(all)
     }
 
@@ -294,14 +294,12 @@ impl ConfigFile for MiseToml {
     fn replace_versions(
         &mut self,
         ba: &BackendArg,
-        versions: &[(String, ToolVersionOptions)],
+        versions: Vec<ToolRequest>,
     ) -> eyre::Result<()> {
+        let is_tools_sorted = is_tools_sorted(&self.tools); // was it previously sorted (if so we'll keep it sorted)
         let existing = self.tools.entry(ba.clone()).or_default();
         let output_empty_opts = |opts: &ToolVersionOptions| {
-            if let Some(reg_ba) = REGISTRY_BACKEND_MAP
-                .get(ba.short.as_str())
-                .and_then(|b| b.first())
-            {
+            if let Some(reg_ba) = REGISTRY.get(ba.short.as_str()).and_then(|b| b.ba()) {
                 if reg_ba.opts.as_ref().is_some_and(|o| o == opts) {
                     // in this case the options specified are the same as in the registry so output no options and rely on the defaults
                     return true;
@@ -311,14 +309,7 @@ impl ConfigFile for MiseToml {
         };
         existing.0 = versions
             .iter()
-            .map(|(v, opts)| MiseTomlTool {
-                tt: ToolVersionType::Version(v.clone()),
-                options: if !output_empty_opts(opts) {
-                    Some(opts.clone())
-                } else {
-                    None
-                },
-            })
+            .map(|tr| MiseTomlTool::from(tr.clone()))
             .collect();
         let tools = self
             .doc_mut()?
@@ -336,31 +327,36 @@ impl ConfigFile for MiseToml {
         }
 
         if versions.len() == 1 {
-            if output_empty_opts(&versions[0].1) {
-                tools.insert_formatted(&key, value(versions[0].0.clone()));
+            if output_empty_opts(&versions[0].options()) {
+                tools.insert_formatted(&key, value(versions[0].version()));
             } else {
                 let mut table = InlineTable::new();
-                table.insert("version", versions[0].0.to_string().into());
-                for (k, v) in &versions[0].1 {
-                    table.insert(k, v.clone().into());
+                table.insert("version", versions[0].version().into());
+                for (k, v) in versions[0].options() {
+                    table.insert(k, v.into());
                 }
                 tools.insert_formatted(&key, table.into());
             }
         } else {
             let mut arr = Array::new();
-            for (v, opts) in versions {
-                if output_empty_opts(opts) {
+            for tr in versions {
+                let v = tr.version();
+                if output_empty_opts(&tr.options()) {
                     arr.push(v.to_string());
                 } else {
                     let mut table = InlineTable::new();
                     table.insert("version", v.to_string().into());
-                    for (k, v) in opts {
+                    for (k, v) in tr.options() {
                         table.insert(k, v.clone().into());
                     }
                     arr.push(table);
                 }
             }
             tools.insert_formatted(&key, Item::Value(Value::Array(arr)));
+        }
+
+        if is_tools_sorted {
+            tools.sort_values();
         }
 
         Ok(())
@@ -371,7 +367,9 @@ impl ConfigFile for MiseToml {
         if let Some(parent) = self.path.parent() {
             create_dir_all(parent)?;
         }
-        file::write(&self.path, contents)
+        file::write(&self.path, contents)?;
+        trust(&self.path)?;
+        Ok(())
     }
 
     fn dump(&self) -> eyre::Result<String> {
@@ -385,22 +383,19 @@ impl ConfigFile for MiseToml {
     fn to_tool_request_set(&self) -> eyre::Result<ToolRequestSet> {
         let source = ToolSource::MiseToml(self.path.clone());
         let mut trs = ToolRequestSet::new();
-        for (fa, tvp) in &self.tools {
+        for (ba, tvp) in &self.tools {
             for tool in &tvp.0 {
-                if let ToolVersionType::Path(_) = &tool.tt {
-                    trust_check(&self.path)?;
-                }
                 let version = self.parse_template(&tool.tt.to_string())?;
-                if let Some(mut options) = tool.options.clone() {
+                let mut tvr = if let Some(mut options) = tool.options.clone() {
                     for v in options.values_mut() {
                         *v = self.parse_template(v)?;
                     }
-                    let tvr = ToolRequest::new_opts(fa.clone(), &version, options, source.clone())?;
-                    trs.add_version(tvr, &source);
+                    ToolRequest::new_opts(ba.clone(), &version, options, source.clone())?
                 } else {
-                    let tvr = ToolRequest::new(fa.clone(), &version, source.clone())?;
-                    trs.add_version(tvr, &source);
-                }
+                    ToolRequest::new(ba.clone(), &version, source.clone())?
+                };
+                tvr = tvr.with_os(tool.os.clone());
+                trs.add_version(tvr, &source);
             }
         }
         Ok(trs)
@@ -433,6 +428,10 @@ impl ConfigFile for MiseToml {
 
     fn task_config(&self) -> &TaskConfig {
         &self.task_config
+    }
+
+    fn vars(&self) -> eyre::Result<&IndexMap<String, String>> {
+        Ok(&self.vars)
     }
 }
 
@@ -496,6 +495,105 @@ impl Clone for MiseToml {
             tasks: self.tasks.clone(),
             task_config: self.task_config.clone(),
             settings: self.settings.clone(),
+            vars: self.vars.clone(),
+        }
+    }
+}
+
+impl From<ToolRequest> for MiseTomlTool {
+    fn from(tr: ToolRequest) -> Self {
+        match tr {
+            ToolRequest::Version {
+                version,
+                os,
+                options,
+                backend: _backend,
+                source: _source,
+            } => Self {
+                tt: ToolVersionType::Version(version),
+                os,
+                options: if options.is_empty() {
+                    None
+                } else {
+                    Some(options)
+                },
+            },
+            ToolRequest::Path {
+                path,
+                os,
+                options,
+                backend: _backend,
+                source: _source,
+            } => Self {
+                tt: ToolVersionType::Path(path),
+                os,
+                options: if options.is_empty() {
+                    None
+                } else {
+                    Some(options)
+                },
+            },
+            ToolRequest::Prefix {
+                prefix,
+                os,
+                options,
+                backend: _backend,
+                source: _source,
+            } => Self {
+                tt: ToolVersionType::Prefix(prefix),
+                os,
+                options: if options.is_empty() {
+                    None
+                } else {
+                    Some(options)
+                },
+            },
+            ToolRequest::Ref {
+                ref_,
+                ref_type,
+                os,
+                options,
+                backend: _backend,
+                source: _source,
+            } => Self {
+                tt: ToolVersionType::Ref(ref_, ref_type),
+                os,
+                options: if options.is_empty() {
+                    None
+                } else {
+                    Some(options)
+                },
+            },
+            ToolRequest::Sub {
+                sub,
+                os,
+                options,
+                orig_version,
+                backend: _backend,
+                source: _source,
+            } => Self {
+                tt: ToolVersionType::Sub { sub, orig_version },
+                os,
+                options: if options.is_empty() {
+                    None
+                } else {
+                    Some(options)
+                },
+            },
+            ToolRequest::System {
+                os,
+                options,
+                backend: _backend,
+                source: _source,
+            } => Self {
+                tt: ToolVersionType::System,
+                os,
+                options: if options.is_empty() {
+                    None
+                } else {
+                    Some(options)
+                },
+            },
         }
     }
 }
@@ -759,7 +857,11 @@ impl<'de> de::Deserialize<'de> for MiseTomlToolList {
                 let tt: ToolVersionType = v
                     .parse()
                     .map_err(|e| de::Error::custom(format!("invalid tool: {e}")))?;
-                Ok(MiseTomlToolList(vec![MiseTomlTool { tt, options: None }]))
+                Ok(MiseTomlToolList(vec![MiseTomlTool {
+                    tt,
+                    os: None,
+                    options: None,
+                }]))
             }
 
             fn visit_seq<S>(self, mut seq: S) -> std::result::Result<Self::Value, S::Error>
@@ -773,24 +875,52 @@ impl<'de> de::Deserialize<'de> for MiseTomlToolList {
                 Ok(MiseTomlToolList(tools))
             }
 
-            fn visit_map<M>(self, map: M) -> std::result::Result<Self::Value, M::Error>
+            fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
             where
                 M: de::MapAccess<'de>,
             {
-                let mut options: BTreeMap<String, String> =
-                    de::Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
-                let tt: ToolVersionType = options
-                    .remove("version")
-                    .or_else(|| options.remove("path").map(|p| format!("path:{p}")))
-                    .or_else(|| options.remove("prefix").map(|p| format!("prefix:{p}")))
-                    .or_else(|| options.remove("ref").map(|p| format!("ref:{p}")))
-                    .ok_or_else(|| de::Error::custom("missing version"))?
-                    .parse()
-                    .map_err(de::Error::custom)?;
-                Ok(MiseTomlToolList(vec![MiseTomlTool {
-                    tt,
-                    options: Some(options),
-                }]))
+                let mut options: BTreeMap<String, String> = Default::default();
+                let mut os: Option<Vec<String>> = None;
+                let mut tt: Option<ToolVersionType> = None;
+                while let Some((k, v)) = map.next_entry::<String, toml::Value>()? {
+                    match k.as_str() {
+                        "version" => {
+                            tt = Some(v.as_str().unwrap().parse().map_err(de::Error::custom)?);
+                        }
+                        "path" | "prefix" | "ref" => {
+                            tt = Some(
+                                format!("{k}:{}", v.as_str().unwrap())
+                                    .parse()
+                                    .map_err(de::Error::custom)?,
+                            );
+                        }
+                        "os" => match v {
+                            toml::Value::Array(s) => {
+                                os = Some(
+                                    s.iter().map(|v| v.as_str().unwrap().to_string()).collect(),
+                                );
+                            }
+                            toml::Value::String(s) => {
+                                options.insert(k, s);
+                            }
+                            _ => {
+                                return Err(de::Error::custom("os must be a string or array"));
+                            }
+                        },
+                        _ => {
+                            options.insert(k, v.as_str().unwrap().to_string());
+                        }
+                    }
+                }
+                if let Some(tt) = tt {
+                    Ok(MiseTomlToolList(vec![MiseTomlTool {
+                        tt,
+                        os,
+                        options: Some(options),
+                    }]))
+                } else {
+                    Err(de::Error::custom("missing version"))
+                }
             }
         }
 
@@ -818,25 +948,51 @@ impl<'de> de::Deserialize<'de> for MiseTomlTool {
                 let tt: ToolVersionType = v
                     .parse()
                     .map_err(|e| de::Error::custom(format!("invalid tool: {e}")))?;
-                Ok(MiseTomlTool { tt, options: None })
+                Ok(MiseTomlTool {
+                    tt,
+                    os: None,
+                    options: None,
+                })
             }
 
-            fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
             where
                 M: de::MapAccess<'de>,
             {
-                let mut options: BTreeMap<String, String> =
-                    de::Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
-                let tt: ToolVersionType = options
-                    .remove("version")
-                    .or_else(|| options.remove("path").map(|p| format!("path:{p}")))
-                    .or_else(|| options.remove("prefix").map(|p| format!("prefix:{p}")))
-                    .or_else(|| options.remove("ref").map(|p| format!("ref:{p}")))
-                    .ok_or_else(|| de::Error::custom("missing version"))?
-                    .parse()
-                    .map_err(de::Error::custom)?;
+                let mut options: BTreeMap<String, String> = Default::default();
+                let mut os: Option<Vec<String>> = None;
+                let mut tt = ToolVersionType::System;
+                while let Some((k, v)) = map.next_entry::<String, toml::Value>()? {
+                    match k.as_str() {
+                        "version" => {
+                            tt = v.as_str().unwrap().parse().map_err(de::Error::custom)?;
+                        }
+                        "path" | "prefix" | "ref" => {
+                            tt = format!("{k}:{}", v.as_str().unwrap())
+                                .parse()
+                                .map_err(de::Error::custom)?;
+                        }
+                        "os" => match v {
+                            toml::Value::Array(s) => {
+                                os = Some(
+                                    s.iter().map(|v| v.as_str().unwrap().to_string()).collect(),
+                                );
+                            }
+                            toml::Value::String(s) => {
+                                options.insert(k, s);
+                            }
+                            _ => {
+                                return Err(de::Error::custom("os must be a string or array"));
+                            }
+                        },
+                        _ => {
+                            options.insert(k, v.as_str().unwrap().to_string());
+                        }
+                    }
+                }
                 Ok(MiseTomlTool {
                     tt,
+                    os,
                     options: Some(options),
                 })
             }
@@ -1003,6 +1159,19 @@ impl<'de> de::Deserialize<'de> for Alias {
     }
 }
 
+fn is_tools_sorted(tools: &IndexMap<BackendArg, MiseTomlToolList>) -> bool {
+    let mut last = None;
+    for k in tools.keys() {
+        if let Some(last) = last {
+            if k < last {
+                return false;
+            }
+        }
+        last = Some(k);
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::formatdoc;
@@ -1011,6 +1180,7 @@ mod tests {
 
     use crate::dirs::CWD;
     use crate::test::{replace_path, reset};
+    use crate::toolset::ToolRequest;
 
     use super::*;
 
@@ -1245,9 +1415,9 @@ mod tests {
         let node = "node".into();
         cf.replace_versions(
             &node,
-            &[
-                ("16.0.1".into(), Default::default()),
-                ("18.0.1".into(), Default::default()),
+            vec![
+                ToolRequest::new("node".into(), "16.0.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new("node".into(), "18.0.1", ToolSource::Unknown).unwrap(),
             ],
         )
         .unwrap();

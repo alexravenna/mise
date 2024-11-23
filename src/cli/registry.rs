@@ -1,5 +1,5 @@
 use crate::backend::backend_type::BackendType;
-use crate::plugins::core::CORE_PLUGINS;
+use crate::config::SETTINGS;
 use crate::registry::{RegistryTool, REGISTRY};
 use crate::ui::table;
 use eyre::{bail, Result};
@@ -20,44 +20,40 @@ pub struct Registry {
     /// Show only tools for this backend
     #[clap(short, long)]
     backend: Option<BackendType>,
+
+    /// Hide aliased tools
+    #[clap(long)]
+    hide_aliased: bool,
 }
 
 impl Registry {
     pub fn run(self) -> Result<()> {
         let filter_backend = |rt: &RegistryTool| {
             if let Some(backend) = self.backend {
-                rt.backends
+                rt.backends()
                     .iter()
                     .filter(|full| full.starts_with(&format!("{backend}:")))
                     .cloned()
                     .collect()
             } else {
-                rt.backends.clone()
+                rt.backends()
             }
         };
         if let Some(name) = &self.name {
             if let Some(rt) = REGISTRY.get(name.as_str()) {
-                miseprintln!("{}", rt.backends.join(" "));
+                miseprintln!("{}", rt.backends().join(" "));
             } else {
                 bail!("tool not found in registry: {name}");
             }
         } else {
-            let mut data = REGISTRY
+            let data = REGISTRY
                 .iter()
+                .filter(|(short, _)| !SETTINGS.disable_tools.contains(**short))
+                .filter(|(short, rt)| !self.hide_aliased || **short == rt.short)
                 .map(|(short, rt)| Row::from((short.to_string(), filter_backend(rt).join(" "))))
-                .filter(|row| !row.full.is_empty())
-                .collect_vec();
-            if self.backend.is_none() || self.backend == Some(BackendType::Core) {
-                let core = CORE_PLUGINS
-                    .keys()
-                    .map(|short| Row::from((short.to_string(), format!("core:{short}"))));
-                data.extend(core);
-            }
-            let rows = data
-                .into_iter()
-                .sorted_by(|a, b| a.short.cmp(&b.short))
-                .collect::<Vec<Row>>();
-            let mut table = Table::new(rows);
+                .filter(|row| !row.backends.is_empty())
+                .sorted_by(|a, b| a.short.cmp(&b.short));
+            let mut table = Table::new(data);
             table::default_style(&mut table, false);
             miseprintln!("{table}");
         }
@@ -69,12 +65,12 @@ impl Registry {
 #[tabled(rename_all = "PascalCase")]
 struct Row {
     short: String,
-    full: String,
+    backends: String,
 }
 
 impl From<(String, String)> for Row {
-    fn from((short, full): (String, String)) -> Self {
-        Self { short, full }
+    fn from((short, backends): (String, String)) -> Self {
+        Self { short, backends }
     }
 }
 

@@ -5,6 +5,7 @@ use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Settings, SETTINGS};
 use crate::install_context::InstallContext;
+use crate::toolset::ToolVersion;
 use crate::{file, github};
 use eyre::WrapErr;
 use git2::Repository;
@@ -34,16 +35,13 @@ impl Backend for SPMBackend {
         &self.ba
     }
 
-    fn get_dependencies(
-        &self,
-        _tvr: &crate::toolset::ToolRequest,
-    ) -> eyre::Result<Vec<BackendArg>> {
+    fn get_dependencies(&self) -> eyre::Result<Vec<&str>> {
         // TODO: swift as dependencies (wait for swift core plugin: https://github.com/jdx/mise/pull/1708)
         Ok(vec![])
     }
 
     fn _list_remote_versions(&self) -> eyre::Result<Vec<String>> {
-        let repo = SwiftPackageRepo::new(self.name())?;
+        let repo = SwiftPackageRepo::new(&self.tool_name())?;
         self.remote_version_cache
             .get_or_try_init(|| {
                 Ok(github::list_releases(repo.shorthand.as_str())?
@@ -55,16 +53,20 @@ impl Backend for SPMBackend {
             .cloned()
     }
 
-    fn install_version_impl(&self, ctx: &InstallContext) -> eyre::Result<()> {
+    fn install_version_impl(
+        &self,
+        ctx: &InstallContext,
+        tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
         let settings = Settings::get();
         settings.ensure_experimental("spm backend")?;
 
-        let repo = SwiftPackageRepo::new(self.name())?;
-        let revision = if ctx.tv.version == "latest" {
+        let repo = SwiftPackageRepo::new(&self.tool_name())?;
+        let revision = if tv.version == "latest" {
             self.latest_stable_version()?
                 .ok_or_else(|| eyre::eyre!("No stable versions found"))?
         } else {
-            ctx.tv.version.clone()
+            tv.version.clone()
         };
         let repo_dir = self.clone_package_repo(&repo, &revision)?;
 
@@ -74,14 +76,14 @@ impl Backend for SPMBackend {
         }
         for executable in executables {
             let bin_path = self.build_executable(&executable, &repo_dir, ctx)?;
-            let install_bin_path = ctx.tv.install_path().join("bin");
+            let install_bin_path = tv.install_path().join("bin");
             self.copy_build_artifacts(&executable, &bin_path, &install_bin_path)?;
         }
 
         debug!("Cleaning up temporary files");
         file::remove_all(&repo_dir)?;
 
-        Ok(())
+        Ok(tv)
     }
 }
 

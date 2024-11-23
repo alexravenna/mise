@@ -1,10 +1,3 @@
-use std::collections::{HashMap, HashSet};
-pub use std::env::*;
-use std::path::PathBuf;
-use std::string::ToString;
-use std::sync::RwLock;
-use std::{path, process};
-
 use crate::cli::args::PROFILE_ARG;
 use crate::env_diff::{EnvDiff, EnvDiffOperation, EnvDiffPatches};
 use crate::file::replace_path;
@@ -12,6 +5,12 @@ use crate::hook_env::{deserialize_watches, HookEnvWatches};
 use itertools::Itertools;
 use log::LevelFilter;
 use once_cell::sync::Lazy;
+use std::collections::{HashMap, HashSet};
+pub use std::env::*;
+use std::path::PathBuf;
+use std::string::ToString;
+use std::sync::RwLock;
+use std::{path, process};
 
 pub static ARGS: RwLock<Vec<String>> = RwLock::new(vec![]);
 #[cfg(unix)]
@@ -37,7 +36,7 @@ pub static XDG_CACHE_HOME: Lazy<PathBuf> =
 pub static XDG_CACHE_HOME: Lazy<PathBuf> = Lazy::new(|| {
     var_path("XDG_CACHE_HOME")
         .or_else(|| var_path("TEMP"))
-        .unwrap_or_else(|| temp_dir())
+        .unwrap_or_else(temp_dir)
 });
 #[cfg(all(not(windows), not(macos)))]
 pub static XDG_CACHE_HOME: Lazy<PathBuf> =
@@ -56,6 +55,8 @@ pub static XDG_DATA_HOME: Lazy<PathBuf> = Lazy::new(|| {
 pub static XDG_STATE_HOME: Lazy<PathBuf> =
     Lazy::new(|| var_path("XDG_STATE_HOME").unwrap_or_else(|| HOME.join(".local").join("state")));
 
+/// always display "friendly" errors even in debug mode
+pub static MISE_FRIENDLY_ERROR: Lazy<bool> = Lazy::new(|| var_is_true("MISE_FRIENDLY_ERROR"));
 pub static MISE_CACHE_DIR: Lazy<PathBuf> =
     Lazy::new(|| var_path("MISE_CACHE_DIR").unwrap_or_else(|| XDG_CACHE_HOME.join("mise")));
 pub static MISE_CONFIG_DIR: Lazy<PathBuf> =
@@ -123,8 +124,7 @@ pub static MISE_BIN: Lazy<PathBuf> = Lazy::new(|| {
         .or_else(|| current_exe().ok())
         .unwrap_or_else(|| "mise".into())
 });
-#[cfg(feature = "timings")]
-pub static MISE_TIMINGS: Lazy<Option<String>> = Lazy::new(|| var("MISE_TIMINGS").ok());
+pub static MISE_TIMINGS: Lazy<u8> = Lazy::new(|| var_u8("MISE_TIMINGS"));
 pub static MISE_PID: Lazy<String> = Lazy::new(|| process::id().to_string());
 pub static __MISE_SCRIPT: Lazy<bool> = Lazy::new(|| var_is_true("__MISE_SCRIPT"));
 pub static __MISE_DIFF: Lazy<EnvDiff> = Lazy::new(get_env_diff);
@@ -157,12 +157,28 @@ pub static PATH_NON_PRISTINE: Lazy<Vec<PathBuf>> = Lazy::new(|| match var(&*PATH
 });
 pub static DIRENV_DIFF: Lazy<Option<String>> = Lazy::new(|| var("DIRENV_DIFF").ok());
 pub static GITHUB_TOKEN: Lazy<Option<String>> = Lazy::new(|| {
-    var("MISE_GITHUB_TOKEN")
+    let token = var("MISE_GITHUB_TOKEN")
         .or_else(|_| var("GITHUB_API_TOKEN"))
         .or_else(|_| var("GITHUB_TOKEN"))
         .ok()
-        .and_then(|v| if v.is_empty() { None } else { Some(v) })
+        .and_then(|v| if v.is_empty() { None } else { Some(v) });
+
+    // set or unset the token for plugins+ubi
+    if let Some(token) = token.as_ref() {
+        set_var("MISE_GITHUB_TOKEN", token);
+        set_var("GITHUB_TOKEN", token);
+        set_var("GITHUB_API_TOKEN", token);
+    } else {
+        remove_var("MISE_GITHUB_TOKEN");
+        remove_var("GITHUB_TOKEN");
+        remove_var("GITHUB_API_TOKEN");
+    }
+
+    token
 });
+
+pub static TEST_TRANCHE: Lazy<usize> = Lazy::new(|| var_u8("TEST_TRANCHE") as usize);
+pub static TEST_TRANCHE_COUNT: Lazy<usize> = Lazy::new(|| var_u8("TEST_TRANCHE_COUNT") as usize);
 
 pub static CLICOLOR: Lazy<Option<bool>> = Lazy::new(|| {
     if var("CLICOLOR_FORCE").is_ok_and(|v| v != "0") {
@@ -227,6 +243,18 @@ pub static MISE_NODE_DEFAULT_PACKAGES_FILE: Lazy<PathBuf> = Lazy::new(|| {
         HOME.join(".default-npm-packages")
     })
 });
+pub static MISE_IGNORED_CONFIG_PATHS: Lazy<Vec<PathBuf>> = Lazy::new(|| {
+    var("MISE_IGNORED_CONFIG_PATHS")
+        .ok()
+        .map(|v| {
+            v.split(':')
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+                .map(replace_path)
+                .collect()
+        })
+        .unwrap_or_default()
+});
 pub static MISE_NODE_COREPACK: Lazy<bool> = Lazy::new(|| var_is_true("MISE_NODE_COREPACK"));
 pub static NVM_DIR: Lazy<PathBuf> =
     Lazy::new(|| var_path("NVM_DIR").unwrap_or_else(|| HOME.join(".nvm")));
@@ -242,6 +270,13 @@ fn get_env_diff() -> EnvDiff {
         }),
         None => EnvDiff::default(),
     }
+}
+
+fn var_u8(key: &str) -> u8 {
+    var(key)
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or_default()
 }
 
 fn var_is_true(key: &str) -> bool {
@@ -274,6 +309,10 @@ fn var_option_bool(key: &str) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+pub fn in_home_dir() -> bool {
+    current_dir().is_ok_and(|d| d == *HOME)
 }
 
 pub fn var_path(key: &str) -> Option<PathBuf> {

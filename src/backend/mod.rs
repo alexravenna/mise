@@ -13,20 +13,20 @@ use crate::file::{display_path, remove_all, remove_all_with_warning};
 use crate::install_context::InstallContext;
 use crate::plugins::core::CORE_PLUGINS;
 use crate::plugins::{Plugin, PluginType, VERSION_REGEX};
-use crate::registry::REGISTRY_BACKEND_MAP;
+use crate::registry::REGISTRY;
 use crate::runtime_symlinks::is_runtime_symlink;
-use crate::toolset::{
-    install_state, is_outdated_version, ToolRequest, ToolSource, ToolVersion, Toolset,
-};
+use crate::toolset::{install_state, is_outdated_version, ToolRequest, ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
-use crate::{dirs, env, file, lock_file, plugins, versions_host};
+use crate::{dirs, env, file, hash, lock_file, plugins, versions_host};
 use backend_type::BackendType;
 use console::style;
+use eyre::Result;
 use eyre::{bail, eyre, WrapErr};
 use indexmap::IndexSet;
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use sha2::Sha256;
 
 pub mod aqua;
 pub mod asdf;
@@ -56,35 +56,6 @@ pub fn load_tools() {
     let core_tools = CORE_PLUGINS.values().cloned().collect::<Vec<ABackend>>();
     let mut tools = core_tools;
     time!("load_tools core");
-    let plugins = install_state::list_plugins()
-        .map_err(|err| {
-            warn!("{err:#}");
-        })
-        .unwrap_or_default();
-    if !SETTINGS.disable_backends.contains(&"asdf".to_string()) {
-        tools.extend(
-            plugins
-                .iter()
-                .filter(|(_, p)| **p == PluginType::Asdf)
-                .map(|(p, _)| {
-                    arg_to_backend(BackendArg::new(p.to_string(), Some(format!("asdf:{p}"))))
-                        .unwrap()
-                }),
-        );
-    }
-    time!("load_tools asdf");
-    if !SETTINGS.disable_backends.contains(&"vfox".to_string()) {
-        tools.extend(
-            plugins
-                .iter()
-                .filter(|(_, p)| **p == PluginType::Vfox)
-                .map(|(p, _)| {
-                    arg_to_backend(BackendArg::new(p.to_string(), Some(format!("vfox:{p}"))))
-                        .unwrap()
-                }),
-        );
-    }
-    time!("load_tools vfox");
     tools.extend(
         install_state::list_tools()
             .map_err(|err| {
@@ -92,10 +63,16 @@ pub fn load_tools() {
             })
             .unwrap_or_default()
             .into_values()
-            .flat_map(|ist| arg_to_backend(BackendArg::new(ist.short, Some(ist.full)))),
+            .filter(|ist| ist.full.is_some())
+            .flat_map(|ist| arg_to_backend(ist.into())),
     );
     time!("load_tools install_state");
-    tools.retain(|backend| !SETTINGS.disable_tools.contains(backend.id()));
+    tools.retain(|backend| !SETTINGS.disable_tools().contains(backend.id()));
+    tools.retain(|backend| {
+        !SETTINGS
+            .disable_backends
+            .contains(&backend.get_type().to_string())
+    });
 
     let tools: BackendMap = tools
         .into_iter()
@@ -157,8 +134,8 @@ pub trait Backend: Debug + Send + Sync {
     fn id(&self) -> &str {
         &self.ba().short
     }
-    fn name(&self) -> &str {
-        &self.ba().tool_name
+    fn tool_name(&self) -> String {
+        self.ba().tool_name()
     }
     fn get_type(&self) -> BackendType {
         BackendType::Core
@@ -169,37 +146,41 @@ pub trait Backend: Debug + Send + Sync {
     }
     /// If any of these tools are installing in parallel, we should wait for them to finish
     /// before installing this tool.
-    fn get_dependencies(&self, _tvr: &ToolRequest) -> eyre::Result<Vec<BackendArg>> {
+    fn get_dependencies(&self) -> Result<Vec<&str>> {
         Ok(vec![])
     }
-    fn get_all_dependencies(&self, tvr: &ToolRequest) -> eyre::Result<Vec<BackendArg>> {
-        let mut deps: IndexSet<_> = self
-            .get_dependencies(tvr)?
-            .into_iter()
-            .flat_map(|ba| {
-                let short = ba.short.clone();
-                [ba].into_iter().chain(
-                    REGISTRY_BACKEND_MAP
-                        .get(short.as_str())
-                        .cloned()
-                        .unwrap_or_default(),
-                )
-            })
-            .collect();
-        let dep_backends = deps
-            .iter()
-            .flat_map(|ba| ba.backend())
-            .collect::<Vec<ABackend>>();
-        for dep in dep_backends {
-            // TODO: pass the right tvr
-            let tvr = ToolRequest::System(dep.id().into(), ToolSource::Unknown);
-            deps.extend(dep.get_all_dependencies(&tvr)?);
+    /// dependencies which wait for install but do not warn, like cargo-binstall
+    fn get_optional_dependencies(&self) -> Result<Vec<&str>> {
+        Ok(vec![])
+    }
+    fn get_all_dependencies(&self, optional: bool) -> Result<IndexSet<BackendArg>> {
+        let all_fulls = self.ba().all_fulls();
+        if all_fulls.is_empty() {
+            // this can happen on windows where we won't be able to install this os/arch so
+            // the fact there might be dependencies is meaningless
+            return Ok(Default::default());
         }
-        Ok(deps.into_iter().collect())
+        let mut deps: Vec<&str> = self.get_dependencies()?;
+        if optional {
+            deps.extend(self.get_optional_dependencies()?);
+        }
+        let mut deps: IndexSet<_> = deps.into_iter().map(BackendArg::from).collect();
+        if let Some(rt) = REGISTRY.get(self.ba().short.as_str()) {
+            // add dependencies from registry.toml
+            deps.extend(rt.depends.iter().map(BackendArg::from));
+        }
+        deps.retain(|ba| self.ba() != ba);
+        deps.retain(|ba| !all_fulls.contains(&ba.full()));
+        for ba in deps.clone() {
+            if let Ok(backend) = ba.backend() {
+                deps.extend(backend.get_all_dependencies(optional)?);
+            }
+        }
+        Ok(deps)
     }
 
     fn list_remote_versions(&self) -> eyre::Result<Vec<String>> {
-        self.ensure_dependencies_installed()?;
+        self.warn_if_dependencies_missing()?;
         self.get_remote_version_cache()
             .get_or_try_init(|| {
                 trace!("Listing remote versions for {}", self.ba().to_string());
@@ -240,22 +221,40 @@ pub trait Backend: Debug + Send + Sync {
         install_state::list_versions(&self.ba().short)
     }
     fn is_version_installed(&self, tv: &ToolVersion, check_symlink: bool) -> bool {
-        match tv.request {
-            ToolRequest::System(..) => true,
-            _ => {
-                let check_path = |install_path: &Path| {
-                    let is_installed = install_path.exists();
-                    let is_not_incomplete = !self.incomplete_file_path(tv).exists();
-                    let is_valid_symlink = !check_symlink || !is_runtime_symlink(install_path);
+        let check_path = |install_path: &Path, check_symlink: bool| {
+            let is_installed = install_path.exists();
+            let is_not_incomplete = !self.incomplete_file_path(tv).exists();
+            let is_valid_symlink = !check_symlink || !is_runtime_symlink(install_path);
 
-                    is_installed && is_not_incomplete && is_valid_symlink
-                };
+            let installed = is_installed && is_not_incomplete && is_valid_symlink;
+            if log::log_enabled!(log::Level::Trace) && !installed {
+                let mut msg = format!(
+                    "{} is not installed, path: {}",
+                    self.ba(),
+                    display_path(install_path)
+                );
+                if !is_installed {
+                    msg += " (not installed)";
+                }
+                if !is_not_incomplete {
+                    msg += " (incomplete)";
+                }
+                if !is_valid_symlink {
+                    msg += " (runtime symlink)";
+                }
+                trace!("{}", msg);
+            }
+            installed
+        };
+        match tv.request {
+            ToolRequest::System { .. } => true,
+            _ => {
                 if let Some(install_path) = tv.request.install_path() {
-                    if check_path(&install_path) {
+                    if check_path(&install_path, true) {
                         return true;
                     }
                 }
-                check_path(&tv.install_path())
+                check_path(&tv.install_path(), check_symlink)
             }
         }
     }
@@ -335,18 +334,20 @@ pub trait Backend: Debug + Send + Sync {
         }
     }
 
-    fn ensure_dependencies_installed(&self) -> eyre::Result<()> {
+    fn warn_if_dependencies_missing(&self) -> eyre::Result<()> {
         let deps = self
-            .get_all_dependencies(&ToolRequest::System(self.id().into(), ToolSource::Unknown))?
+            .get_all_dependencies(false)?
             .into_iter()
+            .filter(|ba| self.ba() != ba)
+            .map(|ba| ba.short)
             .collect::<HashSet<_>>();
         if !deps.is_empty() {
             trace!("Ensuring dependencies installed for {}", self.id());
             let config = Config::get();
-            let ts = config.get_tool_request_set()?.filter_by_tool(&deps);
+            let ts = config.get_tool_request_set()?.filter_by_tool(deps);
             let missing = ts.missing_tools();
             if !missing.is_empty() {
-                bail!(
+                warn_once!(
                     "missing dependency: {}",
                     missing.iter().map(|d| d.to_string()).join(", "),
                 );
@@ -374,34 +375,34 @@ pub trait Backend: Debug + Send + Sync {
         None
     }
 
-    fn install_version(&self, ctx: InstallContext) -> eyre::Result<()> {
+    fn install_version(&self, ctx: InstallContext, tv: ToolVersion) -> eyre::Result<ToolVersion> {
         if let Some(plugin) = self.plugin() {
             plugin.is_installed_err()?;
         }
         let config = Config::get();
-        if self.is_version_installed(&ctx.tv, true) {
+        if self.is_version_installed(&tv, true) {
             if ctx.force {
-                self.uninstall_version(&ctx.tv, ctx.pr.as_ref(), false)?;
+                self.uninstall_version(&tv, ctx.pr.as_ref(), false)?;
             } else {
-                return Ok(());
+                return Ok(tv);
             }
         }
-        ctx.pr.set_message("installing".into());
-        let _lock = lock_file::get(&ctx.tv.install_path(), ctx.force)?;
-        self.create_install_dirs(&ctx.tv)?;
+        ctx.pr.set_message("install".into());
+        let _lock = lock_file::get(&tv.install_path(), ctx.force)?;
+        self.create_install_dirs(&tv)?;
 
-        if let Err(e) = self.install_version_impl(&ctx) {
-            self.cleanup_install_dirs_on_error(&ctx.tv);
-            return Err(e.wrap_err(format!(
-                "Failed to install {}@{}",
-                self.id(),
-                ctx.tv.version
-            )));
-        }
+        let old_tv = tv.clone();
+        let tv = match self.install_version_impl(&ctx, tv) {
+            Ok(tv) => tv,
+            Err(e) => {
+                self.cleanup_install_dirs_on_error(&old_tv);
+                return Err(e);
+            }
+        };
 
-        self.write_backend_meta()?;
+        install_state::write_backend_meta(self.ba())?;
 
-        self.cleanup_install_dirs(&ctx.tv);
+        self.cleanup_install_dirs(&tv);
         // attempt to touch all the .tool-version files to trigger updates in hook-env
         let mut touch_dirs = vec![dirs::DATA.to_path_buf()];
         touch_dirs.extend(config.config_files.keys().cloned());
@@ -411,33 +412,39 @@ pub trait Backend: Debug + Send + Sync {
                 debug!("error touching config file: {:?} {:?}", path, err);
             }
         }
-        if let Err(err) = file::remove_file(self.incomplete_file_path(&ctx.tv)) {
+        if let Err(err) = file::remove_file(self.incomplete_file_path(&tv)) {
             debug!("error removing incomplete file: {:?}", err);
         }
-        if let Some(script) = ctx.tv.request.options().get("postinstall") {
+        if let Some(script) = tv.request.options().get("postinstall") {
             ctx.pr
                 .finish_with_message("running custom postinstall hook".to_string());
-            self.run_postinstall_hook(&ctx, script)?;
+            self.run_postinstall_hook(&ctx, &tv, script)?;
         }
         ctx.pr.finish_with_message("installed".to_string());
 
-        Ok(())
+        Ok(tv)
     }
 
-    fn run_postinstall_hook(&self, ctx: &InstallContext, script: &str) -> eyre::Result<()> {
+    fn run_postinstall_hook(
+        &self,
+        ctx: &InstallContext,
+        tv: &ToolVersion,
+        script: &str,
+    ) -> eyre::Result<()> {
         CmdLineRunner::new(&*env::SHELL)
-            .env(
-                &*env::PATH_KEY,
-                plugins::core::path_env_with_tv_path(&ctx.tv)?,
-            )
+            .env(&*env::PATH_KEY, plugins::core::path_env_with_tv_path(tv)?)
             .with_pr(ctx.pr.as_ref())
             .arg("-c")
             .arg(script)
-            .envs(self.exec_env(&CONFIG, ctx.ts, &ctx.tv)?)
+            .envs(self.exec_env(&CONFIG, ctx.ts, tv)?)
             .execute()?;
         Ok(())
     }
-    fn install_version_impl(&self, ctx: &InstallContext) -> eyre::Result<()>;
+    fn install_version_impl(
+        &self,
+        ctx: &InstallContext,
+        tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion>;
     fn uninstall_version(
         &self,
         tv: &ToolVersion,
@@ -453,7 +460,7 @@ pub trait Backend: Debug + Send + Sync {
             if !dir.exists() {
                 return Ok(());
             }
-            pr.set_message(format!("removing {}", display_path(dir)));
+            pr.set_message(format!("remove {}", display_path(dir)));
             if dryrun {
                 return Ok(());
             }
@@ -473,7 +480,7 @@ pub trait Backend: Debug + Send + Sync {
     }
     fn list_bin_paths(&self, tv: &ToolVersion) -> eyre::Result<Vec<PathBuf>> {
         match tv.request {
-            ToolRequest::System(..) => Ok(vec![]),
+            ToolRequest::System { .. } => Ok(vec![]),
             _ => Ok(vec![tv.install_path().join("bin")]),
         }
     }
@@ -493,9 +500,21 @@ pub trait Backend: Debug + Send + Sync {
             .into_iter()
             .filter(|p| p.parent().is_some());
         for bin_path in bin_paths {
-            let bin_path = bin_path.join(bin_name);
-            if bin_path.exists() {
-                return Ok(Some(bin_path));
+            let paths_with_ext = if cfg!(windows) {
+                vec![
+                    bin_path.clone(),
+                    bin_path.join(bin_name).with_extension("exe"),
+                    bin_path.join(bin_name).with_extension("cmd"),
+                    bin_path.join(bin_name).with_extension("bat"),
+                    bin_path.join(bin_name).with_extension("ps1"),
+                ]
+            } else {
+                vec![bin_path.join(bin_name)]
+            };
+            for bin_path in paths_with_ext {
+                if bin_path.exists() && file::is_executable(&bin_path) {
+                    return Ok(Some(bin_path));
+                }
             }
         }
         Ok(None)
@@ -530,18 +549,26 @@ pub trait Backend: Debug + Send + Sync {
     fn dependency_toolset(&self) -> eyre::Result<Toolset> {
         let config = Config::get();
         let dependencies = self
-            .get_all_dependencies(&ToolRequest::System(
-                self.name().into(),
-                ToolSource::Unknown,
-            ))?
+            .get_all_dependencies(true)?
             .into_iter()
+            .map(|ba| ba.short)
             .collect();
         let mut ts: Toolset = config
             .get_tool_request_set()?
-            .filter_by_tool(&dependencies)
+            .filter_by_tool(dependencies)
             .into();
         ts.resolve()?;
         Ok(ts)
+    }
+
+    fn dependency_which(&self, bin: &str) -> Option<PathBuf> {
+        file::which_non_pristine(bin).or_else(|| {
+            self.dependency_toolset()
+                .ok()
+                .and_then(|ts| ts.which(bin))
+                .and_then(|(b, tv)| b.which(&tv, bin).ok())
+                .flatten()
+        })
     }
 
     fn dependency_env(&self) -> eyre::Result<BTreeMap<String, String>> {
@@ -595,11 +622,26 @@ pub trait Backend: Debug + Send + Sync {
             .clone()
     }
 
-    fn write_backend_meta(&self) -> eyre::Result<()> {
-        file::write(
-            self.ba().installs_path.join(".mise.backend"),
-            format!("{}\n{}", self.ba().short, self.ba().full()),
-        )
+    fn verify_checksum(
+        &self,
+        ctx: &InstallContext,
+        tv: &mut ToolVersion,
+        file: &Path,
+    ) -> Result<()> {
+        let filename = file.file_name().unwrap().to_string_lossy().to_string();
+        if let Some(checksum) = &tv.checksums.get(&filename) {
+            ctx.pr.set_message(format!("checksum {filename}"));
+            if let Some((algo, check)) = checksum.split_once(':') {
+                hash::ensure_checksum(file, check, Some(ctx.pr.as_ref()), algo)?;
+            } else {
+                bail!("Invalid checksum: {checksum}");
+            }
+        } else if SETTINGS.lockfile && SETTINGS.experimental {
+            ctx.pr.set_message(format!("generate checksum {filename}"));
+            let hash = hash::file_hash_prog::<Sha256>(file, Some(ctx.pr.as_ref()))?;
+            tv.checksums.insert(filename, format!("sha256:{hash}"));
+        }
+        Ok(())
     }
 }
 
@@ -614,7 +656,7 @@ fn rmdir(dir: &Path, pr: &dyn SingleReport) -> eyre::Result<()> {
     if !dir.exists() {
         return Ok(());
     }
-    pr.set_message(format!("removing {}", &dir.to_string_lossy()));
+    pr.set_message(format!("remove {}", &dir.to_string_lossy()));
     remove_all(dir).wrap_err_with(|| {
         format!(
             "Failed to remove directory {}",

@@ -3,9 +3,11 @@ use std::ffi::OsStr;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use eyre::eyre;
+use eyre::Result;
+use indexmap::IndexMap;
 use legacy_version::LegacyVersionFile;
 use once_cell::sync::Lazy;
 use serde_derive::Deserialize;
@@ -21,7 +23,7 @@ use crate::errors::Error::UntrustedConfig;
 use crate::file::display_path;
 use crate::hash::{file_hash_sha256, hash_to_str};
 use crate::task::Task;
-use crate::toolset::{ToolRequestSet, ToolSource, ToolVersionList, ToolVersionOptions, Toolset};
+use crate::toolset::{ToolRequest, ToolRequestSet, ToolSource, ToolVersionList, Toolset};
 use crate::ui::{prompt, style};
 use crate::{backend, dirs, env, file};
 
@@ -70,12 +72,9 @@ pub trait ConfigFile: Debug + Send + Sync {
     fn tasks(&self) -> Vec<&Task> {
         Default::default()
     }
-    fn remove_plugin(&mut self, _fa: &BackendArg) -> eyre::Result<()>;
-    fn replace_versions(
-        &mut self,
-        fa: &BackendArg,
-        versions: &[(String, ToolVersionOptions)],
-    ) -> eyre::Result<()>;
+    fn remove_plugin(&mut self, ba: &BackendArg) -> eyre::Result<()>;
+    fn replace_versions(&mut self, ba: &BackendArg, versions: Vec<ToolRequest>)
+        -> eyre::Result<()>;
     fn save(&self) -> eyre::Result<()>;
     fn dump(&self) -> eyre::Result<String>;
     fn source(&self) -> ToolSource;
@@ -89,6 +88,10 @@ pub trait ConfigFile: Debug + Send + Sync {
     fn task_config(&self) -> &TaskConfig {
         static DEFAULT_TASK_CONFIG: Lazy<TaskConfig> = Lazy::new(TaskConfig::default);
         &DEFAULT_TASK_CONFIG
+    }
+    fn vars(&self) -> Result<&IndexMap<String, String>> {
+        static DEFAULT_VARS: Lazy<IndexMap<String, String>> = Lazy::new(IndexMap::new);
+        Ok(&DEFAULT_VARS)
     }
 }
 
@@ -117,19 +120,34 @@ impl dyn ConfigFile {
             ts.versions.insert(fa.clone(), tvl);
         }
         ts.resolve()?;
-        for (fa, versions) in plugins_to_update {
+        for (ba, versions) in plugins_to_update {
             let versions = versions
                 .into_iter()
-                .map(|tvr| {
+                .map(|tr| {
+                    let mut tr = tr.clone();
                     if pin {
-                        let tv = tvr.resolve(&Default::default())?;
-                        Ok((tv.version, tv.request.options()))
-                    } else {
-                        Ok((tvr.version(), tvr.options()))
+                        let tv = tr.resolve(&Default::default())?;
+                        if let ToolRequest::Version {
+                            version: _version,
+                            source,
+                            os,
+                            options,
+                            backend,
+                        } = tr
+                        {
+                            tr = ToolRequest::Version {
+                                version: tv.version,
+                                source,
+                                os,
+                                options,
+                                backend,
+                            };
+                        }
                     }
+                    Ok(tr)
                 })
                 .collect::<eyre::Result<Vec<_>>>()?;
-            self.replace_versions(&fa, &versions)?;
+            self.replace_versions(&ba, versions)?;
         }
 
         Ok(())
@@ -209,7 +227,7 @@ pub fn trust_check(path: &Path) -> eyre::Result<()> {
     if is_trusted(path) || cmd == "trust" || cfg!(test) {
         return Ok(());
     }
-    if cmd != "hook-env" {
+    if cmd != "hook-env" && !is_ignored(path) {
         let ans = prompt::confirm_with_all(format!(
             "{} {} is not trusted. Trust it?",
             style::eyellow("mise"),
@@ -218,15 +236,14 @@ pub fn trust_check(path: &Path) -> eyre::Result<()> {
         if ans {
             trust(path)?;
             return Ok(());
+        } else {
+            add_ignored(path.to_path_buf())?;
         }
     }
     Err(UntrustedConfig(path.into()))?
 }
 
-static IS_TRUSTED: Lazy<Mutex<HashSet<PathBuf>>> = Lazy::new(|| Mutex::new(HashSet::new()));
-
 pub fn is_trusted(path: &Path) -> bool {
-    let mut cached = IS_TRUSTED.lock().unwrap();
     let canonicalized_path = match path.canonicalize() {
         Ok(p) => p,
         Err(err) => {
@@ -234,13 +251,20 @@ pub fn is_trusted(path: &Path) -> bool {
             return false;
         }
     };
-    if cached.contains(canonicalized_path.as_path()) {
+    if is_ignored(canonicalized_path.as_path()) {
+        return false;
+    }
+    if IS_TRUSTED
+        .lock()
+        .unwrap()
+        .contains(canonicalized_path.as_path())
+    {
         return true;
     }
     let settings = Settings::get();
     for p in settings.trusted_config_paths() {
         if canonicalized_path.starts_with(p) {
-            cached.insert(canonicalized_path.to_path_buf());
+            add_trusted(canonicalized_path.to_path_buf());
             return true;
         }
     }
@@ -260,11 +284,58 @@ pub fn is_trusted(path: &Path) -> bool {
         // trust config files
         return false;
     }
-    cached.insert(canonicalized_path.to_path_buf());
+    add_trusted(canonicalized_path.to_path_buf());
     true
 }
 
+static IS_TRUSTED: Lazy<Mutex<HashSet<PathBuf>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+static IS_IGNORED: Lazy<Mutex<HashSet<PathBuf>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+fn add_trusted(path: PathBuf) {
+    IS_TRUSTED.lock().unwrap().insert(path);
+}
+pub fn add_ignored(path: PathBuf) -> Result<()> {
+    let path = path.canonicalize()?;
+    file::create_dir_all(&*dirs::IGNORED_CONFIGS)?;
+    file::make_symlink_or_file(&path, &ignore_path(&path))?;
+    IS_IGNORED.lock().unwrap().insert(path);
+    Ok(())
+}
+pub fn rm_ignored(path: PathBuf) -> Result<()> {
+    let path = path.canonicalize()?;
+    let ignore_path = ignore_path(&path);
+    if ignore_path.exists() {
+        file::remove_file(&ignore_path)?;
+    }
+    IS_IGNORED.lock().unwrap().remove(&path);
+    Ok(())
+}
+pub fn is_ignored(path: &Path) -> bool {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if !dirs::IGNORED_CONFIGS.exists() {
+            return;
+        }
+        let mut is_ignored = IS_IGNORED.lock().unwrap();
+        for entry in file::ls(&dirs::IGNORED_CONFIGS).unwrap_or_default() {
+            if let Ok(canonicalized_path) = entry.canonicalize() {
+                is_ignored.insert(canonicalized_path);
+            }
+        }
+    });
+    if let Ok(path) = path.canonicalize() {
+        env::MISE_IGNORED_CONFIG_PATHS
+            .iter()
+            .any(|p| path.starts_with(p))
+            || IS_IGNORED.lock().unwrap().contains(&path)
+    } else {
+        debug!("is_ignored: path canonicalize failed");
+        true
+    }
+}
+
 pub fn trust(path: &Path) -> eyre::Result<()> {
+    rm_ignored(path.to_path_buf())?;
     let hashed_path = trust_path(path);
     if !hashed_path.exists() {
         file::create_dir_all(hashed_path.parent().unwrap())?;
@@ -277,6 +348,7 @@ pub fn trust(path: &Path) -> eyre::Result<()> {
 }
 
 pub fn untrust(path: &Path) -> eyre::Result<()> {
+    rm_ignored(path.to_path_buf())?;
     let hashed_path = trust_path(path);
     if hashed_path.exists() {
         file::remove_file(hashed_path)?;
@@ -286,17 +358,30 @@ pub fn untrust(path: &Path) -> eyre::Result<()> {
 
 /// generates a path like ~/.mise/trusted-configs/dir-file-3e8b8c44c3.toml
 fn trust_path(path: &Path) -> PathBuf {
+    dirs::TRUSTED_CONFIGS.join(hashed_path_filename(path))
+}
+
+fn ignore_path(path: &Path) -> PathBuf {
+    dirs::IGNORED_CONFIGS.join(hashed_path_filename(path))
+}
+
+/// creates the filename portion of trust/ignore files, e.g.:
+fn hashed_path_filename(path: &Path) -> String {
     let canonicalized_path = path.canonicalize().unwrap();
     let hash = hash_to_str(&canonicalized_path);
-    let trust_path = dirs::TRUSTED_CONFIGS.join(hash_to_str(&hash));
-    if trust_path.exists() {
-        return trust_path;
-    }
     let trunc_str = |s: &OsStr| {
         let mut s = s.to_str().unwrap().to_string();
         s.truncate(20);
         s
     };
+    let trust_path = dirs::TRUSTED_CONFIGS.join(hash_to_str(&hash));
+    if trust_path.exists() {
+        return trust_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+    }
     let parent = canonicalized_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -304,14 +389,11 @@ fn trust_path(path: &Path) -> PathBuf {
         .file_name()
         .map(trunc_str);
     let filename = canonicalized_path.file_name().map(trunc_str);
-
-    dirs::TRUSTED_CONFIGS.join(
-        [parent, filename, Some(hash)]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("-"),
-    )
+    [parent, filename, Some(hash)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn trust_file_hash(path: &Path) -> eyre::Result<bool> {
@@ -370,8 +452,8 @@ pub struct TaskConfig {
 
 #[cfg(test)]
 pub fn reset() {
-    let mut cached = IS_TRUSTED.lock().unwrap();
-    cached.clear();
+    IS_TRUSTED.lock().unwrap().clear();
+    IS_IGNORED.lock().unwrap().clear();
 }
 
 #[cfg(test)]

@@ -16,6 +16,9 @@ mod output;
 mod hint;
 
 #[macro_use]
+mod timings;
+
+#[macro_use]
 mod cmd;
 
 mod aqua;
@@ -27,7 +30,6 @@ mod config;
 mod direnv;
 mod dirs;
 pub(crate) mod duration;
-pub(crate) mod eager;
 mod env;
 mod env_diff;
 mod errors;
@@ -58,26 +60,24 @@ mod shorthands;
 pub(crate) mod task;
 pub(crate) mod tera;
 pub(crate) mod timeout;
+mod tokio;
 mod toml;
 mod toolset;
 mod ui;
 mod versions_host;
 
-pub use crate::exit::exit;
+pub(crate) use crate::exit::exit;
+pub(crate) use crate::toolset::install_state;
 
 fn main() -> eyre::Result<()> {
-    #[cfg(feature = "timings")]
-    output::get_time_diff(""); // throwaway call to initialize the timer
-    eager::early_init();
-    let args = env::args().collect_vec();
     color_eyre::install()?;
-    time!("main start");
-
-    match Cli::run(&args).with_section(|| VERSION.to_string().header("Version:")) {
-        Ok(()) => Ok(()),
-        Err(err) => handle_err(err),
-    }?;
-    time!("main done");
+    measure!("main", {
+        let args = env::args().collect_vec();
+        match Cli::run(&args).with_section(|| VERSION.to_string().header("Version:")) {
+            Ok(()) => Ok(()),
+            Err(err) => handle_err(err),
+        }?;
+    });
     Ok(())
 }
 
@@ -88,7 +88,9 @@ fn handle_err(err: Report) -> eyre::Result<()> {
         }
     }
     show_github_rate_limit_err(&err);
-    if cfg!(not(debug_assertions)) && log::max_level() < log::LevelFilter::Debug {
+    if *env::MISE_FRIENDLY_ERROR
+        || (!cfg!(debug_assertions) && log::max_level() < log::LevelFilter::Debug)
+    {
         display_friendly_err(&err);
         exit(1);
     }

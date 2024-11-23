@@ -2,16 +2,16 @@ use crate::file::{display_path, remove_all};
 use crate::git::Git;
 use crate::plugins::{Plugin, PluginType};
 use crate::result::Result;
+use crate::tokio::RUNTIME;
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
 use crate::{dirs, registry};
 use console::style;
 use contracts::requires;
-use eyre::{eyre, Context, Report};
+use eyre::{eyre, Context};
 use indexmap::{indexmap, IndexMap};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex, MutexGuard};
-use tokio::runtime::Runtime;
 use url::Url;
 use vfox::Vfox;
 use xx::regex;
@@ -27,8 +27,7 @@ pub struct VfoxPlugin {
 
 impl VfoxPlugin {
     #[requires(!name.is_empty())]
-    pub fn new(name: String) -> Self {
-        let plugin_path = dirs::PLUGINS.join(&name);
+    pub fn new(name: String, plugin_path: PathBuf) -> Self {
         let repo = Git::new(&plugin_path);
         Self {
             name,
@@ -53,7 +52,7 @@ impl VfoxPlugin {
     pub fn mise_env(&self, opts: &toml::Value) -> Result<Option<IndexMap<String, String>>> {
         let (vfox, _) = self.vfox();
         let mut out = indexmap!();
-        let results = self.runtime()?.block_on(vfox.mise_env(&self.name, opts))?;
+        let results = RUNTIME.block_on(vfox.mise_env(&self.name, opts))?;
         for env in results {
             out.insert(env.key, env.value);
         }
@@ -63,7 +62,7 @@ impl VfoxPlugin {
     pub fn mise_path(&self, opts: &toml::Value) -> Result<Option<Vec<String>>> {
         let (vfox, _) = self.vfox();
         let mut out = vec![];
-        let results = self.runtime()?.block_on(vfox.mise_path(&self.name, opts))?;
+        let results = RUNTIME.block_on(vfox.mise_path(&self.name, opts))?;
         for env in results {
             out.push(env);
         }
@@ -78,14 +77,6 @@ impl VfoxPlugin {
         vfox.install_dir = dirs::INSTALLS.to_path_buf();
         let rx = vfox.log_subscribe();
         (vfox, rx)
-    }
-
-    pub fn runtime(&self) -> eyre::Result<Runtime, Report> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .enable_io()
-            .build()?;
-        Ok(rt)
     }
 }
 
@@ -137,11 +128,12 @@ impl Plugin for VfoxPlugin {
             .wrap_err("run with --yes to install plugin automatically"))
     }
 
-    fn ensure_installed(&self, _mpr: &MultiProgressReport, _force: bool) -> Result<()> {
+    fn ensure_installed(&self, mpr: &MultiProgressReport, _force: bool) -> Result<()> {
         if !self.plugin_path.exists() {
             let url = self.get_repo_url()?;
             trace!("Cloning vfox plugin: {url}");
-            self.repo().clone(url.as_str())?;
+            let pr = mpr.add(&format!("clone vfox plugin {}", url));
+            self.repo().clone(url.as_str(), Some(pr.as_ref()))?;
         }
         Ok(())
     }
@@ -163,7 +155,7 @@ impl Plugin for VfoxPlugin {
             );
             return Ok(());
         }
-        pr.set_message("updating git repo".into());
+        pr.set_message("update git repo".into());
         git.update(gitref)?;
         let sha = git.current_sha_short()?;
         let repo_url = self.get_remote_url()?.unwrap_or_default();
@@ -178,13 +170,13 @@ impl Plugin for VfoxPlugin {
         if !self.is_installed() {
             return Ok(());
         }
-        pr.set_message("uninstalling".into());
+        pr.set_message("uninstall".into());
 
         let rmdir = |dir: &Path| {
             if !dir.exists() {
                 return Ok(());
             }
-            pr.set_message(format!("removing {}", display_path(dir)));
+            pr.set_message(format!("remove {}", display_path(dir)));
             remove_all(dir).wrap_err_with(|| {
                 format!(
                     "Failed to remove directory {}",
@@ -215,10 +207,10 @@ Plugins could support local directories in the future but for now a symlink is r
             ))?;
         }
         let git = Git::new(&self.plugin_path);
-        pr.set_message(format!("cloning {repo_url}"));
-        git.clone(&repo_url)?;
+        pr.set_message(format!("clone {repo_url}"));
+        git.clone(&repo_url, Some(pr))?;
         if let Some(ref_) = &repo_ref {
-            pr.set_message(format!("checking out {ref_}"));
+            pr.set_message(format!("git update {ref_}"));
             git.update(Some(ref_.to_string()))?;
         }
 
@@ -235,8 +227,9 @@ fn vfox_to_url(name: &str) -> eyre::Result<Url> {
     let name = name.strip_prefix("vfox:").unwrap_or(name);
     if let Some(rt) = registry::REGISTRY.get(name.trim_start_matches("vfox-")) {
         // bun -> version-fox/vfox-bun
-        let full = rt.backends.iter().find(|f| f.starts_with("vfox:")).unwrap();
-        return vfox_to_url(full.split_once(':').unwrap().1);
+        if let Some(full) = rt.backends.iter().find(|f| f.starts_with("vfox:")) {
+            return vfox_to_url(full.split_once(':').unwrap().1);
+        }
     }
     let res = if let Some(caps) = regex!(r#"^([^/]+)/([^/]+)$"#).captures(name) {
         let user = caps.get(1).unwrap().as_str();

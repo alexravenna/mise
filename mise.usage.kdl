@@ -101,7 +101,7 @@ For user config, aliases are defined like the following in `~/.config/mise/confi
         after_long_help r"Examples:
 
     $ mise aliases
-    node  lts-jod      22   
+    node  lts-jod      22
 "
         flag "--no-header" help="Don't show table header"
         arg "[TOOL]" help="Show aliases for <TOOL>"
@@ -260,7 +260,7 @@ cmd "current" hide=true help="Shows current active and installed runtime version
 This is similar to `mise ls --current`, but this only shows the runtime
 and/or version. It's designed to fit into scripts more easily."
     after_long_help r"Examples:
-    
+
     # outputs `.tool-versions` compatible format
     $ mise current
     python 3.11.0 3.10.0
@@ -543,7 +543,7 @@ cmd "link" help="Symlinks a tool version into mise" {
 
 Use this for adding installs either custom compiled outside mise or built with a different tool."
     after_long_help r"Examples:
-    
+
     # build node-20.0.0 with node-build and link it into mise
     $ node-build 20.0.0 ~/.nodes/20.0.0
     $ mise link node@20.0.0 ~/.nodes/20.0.0
@@ -635,7 +635,6 @@ It's a useful command to get the current state of your tools."#
     flag "-g --global" help="Only show tool versions currently specified in the global mise.toml"
     flag "-i --installed" help="Only show tool versions that are installed (Hides tools defined in mise.toml but not installed)"
     flag "-o --offline" help="Don't fetch information such as outdated versions"
-    flag "--parseable" help="Output in an easily parseable format" hide=true
     flag "-J --json" help="Output in JSON format"
     flag "-m --missing" help="Display missing tool versions"
     flag "--prefix" help="Display versions matching this prefix" {
@@ -767,10 +766,8 @@ Can also show remotely available plugins to install."
     ruby    https://github.com/asdf-vm/asdf-ruby.git
 "
         flag "-a --all" help="List all available remote plugins\nSame as `mise plugins ls-remote`" hide=true
-        flag "-c --core" help="The built-in plugins only\nNormally these are not shown"
-        flag "--user" help="List installed plugins" {
-            long_help "List installed plugins\n\nThis is the default behavior but can be used with --core\nto show core and user plugins"
-        }
+        flag "-c --core" help="The built-in plugins only\nNormally these are not shown" hide=true
+        flag "--user" help="List installed plugins" hide=true
         flag "-u --urls" help="Show the git url for each plugin\ne.g.: https://github.com/asdf-vm/asdf-nodejs.git"
         flag "--refs" help="Show the git refs for each plugin\ne.g.: main 1234abc" hide=true
     }
@@ -852,6 +849,7 @@ For example, `poetry` is shorthand for `asdf:mise-plugins/mise-poetry`."
     flag "-b --backend" help="Show only tools for this backend" {
         arg "<BACKEND>"
     }
+    flag "--hide-aliased" help="Hide aliased tools"
     arg "[NAME]" help="Show only the specified tool's full name"
 }
 cmd "reshim" help="Creates new shims based on bin paths from currently installed tools." {
@@ -943,8 +941,11 @@ The name of the script will be the name of the tasks.
         arg "<JOBS>"
     }
     flag "-r --raw" help="Read/write directly to stdin/stdout/stderr instead of by line\nConfigure with `raw` config or `MISE_RAW` env var"
-    flag "--timings" help="Shows elapsed time after each task completes" {
+    flag "--timings" help="Shows elapsed time after each task completes" hide=true {
         long_help "Shows elapsed time after each task completes\n\nDefault to always show with `MISE_TASK_TIMINGS=1`"
+    }
+    flag "--no-timings" help="Hides elapsed time after each task completes" {
+        long_help "Hides elapsed time after each task completes\n\nDefault to always hide with `MISE_TASK_TIMINGS=0`"
     }
     mount run="mise tasks --usage"
 }
@@ -989,7 +990,23 @@ By default, this command modifies `mise.toml` in the current directory."
     arg "[ENV_VARS]..." help="Environment variable(s) to set\ne.g.: NODE_ENV=production" var=true
 }
 cmd "settings" help="Manage settings" {
-    flag "--keys" help="Only display key names for each setting"
+    after_long_help r#"Examples:
+    # list all settings
+    $ mise settings
+
+    # get the value of the setting "always_keep_download"
+    $ mise settings always_keep_download
+
+    # set the value of the setting "always_keep_download" to "true"
+    $ mise settings always_keep_download=true
+
+    # set the value of the setting "node.mirror_url" to "https://npm.taobao.org/mirrors/node"
+    $ mise settings node.mirror_url https://npm.taobao.org/mirrors/node
+"#
+    flag "--names" help="Only display key names for each setting"
+    flag "-l --local" help="Use the local config file instead of the global one" global=true
+    arg "[KEY]" help="Setting name to get/set"
+    arg "[VALUE]" help="Setting value to set"
     cmd "add" help="Adds a setting to the configuration file" {
         long_help r"Adds a setting to the configuration file
 
@@ -999,7 +1016,8 @@ This modifies the contents of ~/.config/mise/config.toml"
 
     $ mise settings add disable_hints python_multi
 "
-        arg "<SETTING>" help="The setting to set"
+        flag "-l --local" help="Use the local config file instead of the global one"
+        arg "<KEY>" help="The setting to set"
         arg "<VALUE>" help="The value to set"
     }
     cmd "get" help="Show a current setting" {
@@ -1014,7 +1032,8 @@ but managed separately with `mise aliases get`"
     $ mise settings get legacy_version_file
     true
 "
-        arg "<SETTING>" help="The setting to show"
+        flag "-l --local" help="Use the local config file instead of the global one"
+        arg "<KEY>" help="The setting to show"
     }
     cmd "ls" help="Show current settings" {
         alias "list"
@@ -1024,12 +1043,19 @@ This is the contents of ~/.config/mise/config.toml
 
 Note that aliases are also stored in this file
 but managed separately with `mise aliases`"
-        after_long_help r"Examples:
+        after_long_help r#"Examples:
 
-    $ mise settings
+    $ mise settings ls
     legacy_version_file = false
-"
-        flag "--keys" help="Only display key names for each setting"
+    ...
+
+    $ mise settings ls python
+    default_packages_file = "~/.default-python-packages"
+    ...
+"#
+        flag "-l --local" help="Use the local config file instead of the global one"
+        flag "--names" help="Only display key names for each setting"
+        arg "[KEY]" help="List keys under this key"
     }
     cmd "set" help="Add/update a setting" {
         alias "create"
@@ -1038,9 +1064,10 @@ but managed separately with `mise aliases`"
 This modifies the contents of ~/.config/mise/config.toml"
         after_long_help r"Examples:
 
-    $ mise settings set legacy_version_file true
+    $ mise settings legacy_version_file=true
 "
-        arg "<SETTING>" help="The setting to set"
+        flag "-l --local" help="Use the local config file instead of the global one"
+        arg "<KEY>" help="The setting to set"
         arg "<VALUE>" help="The value to set"
     }
     cmd "unset" help="Clears a setting" {
@@ -1052,7 +1079,8 @@ This modifies the contents of ~/.config/mise/config.toml"
 
     $ mise settings unset legacy_version_file
 "
-        arg "<SETTING>" help="The setting to remove"
+        flag "-l --local" help="Use the local config file instead of the global one"
+        arg "<KEY>" help="The setting to remove"
     }
 }
 cmd "shell" help="Sets a tool version for the current session." {
@@ -1274,13 +1302,49 @@ The name of the script will be the name of the tasks.
             arg "<JOBS>"
         }
         flag "-r --raw" help="Read/write directly to stdin/stdout/stderr instead of by line\nConfigure with `raw` config or `MISE_RAW` env var"
-        flag "--timings" help="Shows elapsed time after each task completes" {
+        flag "--timings" help="Shows elapsed time after each task completes" hide=true {
             long_help "Shows elapsed time after each task completes\n\nDefault to always show with `MISE_TASK_TIMINGS=1`"
+        }
+        flag "--no-timings" help="Hides elapsed time after each task completes" {
+            long_help "Hides elapsed time after each task completes\n\nDefault to always hide with `MISE_TASK_TIMINGS=0`"
         }
         arg "[TASK]" help="Tasks to run\nCan specify multiple tasks by separating with `:::`\ne.g.: mise run task1 arg1 arg2 ::: task2 arg1 arg2" default="default"
         arg "[ARGS]..." help="Arguments to pass to the tasks. Use \":::\" to separate tasks" var=true
         mount run="mise tasks --usage"
     }
+}
+cmd "test-tool" hide=true help="Test a tool installs and executes" {
+    after_long_help r"Examples:
+
+    $ mise test-tool ripgrep
+"
+    flag "-a --all"
+    flag "--include-non-defined" help="Also test tools not defined in registry.toml, guessing how to test it"
+    flag "-j --jobs" help="Number of jobs to run in parallel\n[default: 4]" {
+        arg "<JOBS>"
+    }
+    flag "--raw" help="Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1"
+    arg "[TOOL]"
+}
+cmd "tool" help="Gets information about a tool" {
+    after_long_help r"Examples:
+
+    $ mise tool node
+    Backend:            core
+    Installed Versions: 20.0.0 22.0.0
+    Active Version:     20.0.0
+    Requested Version:  20
+    Config Source:      ~/.config/mise/mise.toml
+    Tool Options:       [none]
+"
+    flag "-J --json" help="Output in JSON format"
+    flag "--backend" help="Only show backend field"
+    flag "--installed" help="Only show installed versions"
+    flag "--active" help="Only show active versions"
+    flag "--requested" help="Only show requested versions"
+    flag "--config-source" help="Only show config source"
+    flag "--tool-options" help="Only show tool options"
+    arg "<BACKEND>" help="Tool name to get information about"
 }
 cmd "trust" help="Marks a config file as trusted" {
     long_help r"Marks a config file as trusted
@@ -1301,7 +1365,8 @@ This includes:
     $ mise trust
 "
     flag "-a --all" help="Trust all config files in the current directory and its parents"
-    flag "--untrust" help="No longer trust this config"
+    flag "--ignore" help="Do not trust this config and ignore it in the future"
+    flag "--untrust" help="No longer trust this config, will prompt in the future"
     flag "--show" help="Show the trusted status of config files from the current directory and its parents.\nDoes not trust or untrust any files."
     arg "[CONFIG_FILE]" help="The config file to trust"
 }
@@ -1459,7 +1524,7 @@ cmd "watch" help="Run task(s) and watch for changes to rerun it" {
 This command uses the `watchexec` tool to watch for changes to files and rerun the specified task(s).
 It must be installed for this command to work, but you can install it with `mise use -g watchexec@latest`."
     after_long_help r#"Examples:
-    
+
     $ mise watch -t build
     Runs the "build" tasks. Will re-run the tasks when any of its sources change.
     Uses "sources" from the tasks definition to determine which files to watch.
@@ -1522,7 +1587,6 @@ Use this to figure out what version of a tool is currently active."
 }
 cmd "render-help" hide=true help="internal command to generate markdown from help"
 cmd "render-mangen" hide=true help="internal command to generate markdown from help"
-
 source_code_link_template "https://github.com/jdx/mise/blob/main/src/cli/{{path}}.rs"
 
 complete "alias" run="mise alias ls {{words[PREV]}} | awk '{print $2}'"
@@ -1579,4 +1643,3 @@ case $cur in
     ;;
 esac
 "#
-

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::backend::Backend;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
-use crate::config::{Config, Settings};
+use crate::config::{Config, Settings, SETTINGS};
 use crate::duration::DAILY;
 use crate::env::PATH_KEY;
 use crate::git::Git;
@@ -13,11 +13,11 @@ use crate::github::GithubRelease;
 use crate::http::{HTTP, HTTP_FETCH};
 use crate::install_context::InstallContext;
 use crate::lock_file::LockFile;
-use crate::toolset::{ToolRequest, ToolVersion, Toolset};
+use crate::toolset::{ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
 use crate::{cmd, env, file, plugins};
-use contracts::requires;
 use eyre::{Result, WrapErr};
+use itertools::Itertools;
 use xx::regex;
 
 #[derive(Debug)]
@@ -61,18 +61,17 @@ impl RubyPlugin {
             .lock()
     }
 
-    fn update_build_tool(&self) -> Result<()> {
-        let settings = Settings::get();
-        if settings.ruby.ruby_install {
-            self.update_ruby_install()
+    fn update_build_tool(&self, ctx: Option<&InstallContext>) -> Result<()> {
+        let pr = ctx.map(|ctx| ctx.pr.as_ref());
+        if SETTINGS.ruby.ruby_install {
+            self.update_ruby_install(pr)
                 .wrap_err("failed to update ruby-install")?;
         }
-        self.update_ruby_build()
+        self.update_ruby_build(pr)
             .wrap_err("failed to update ruby-build")
     }
 
-    fn install_ruby_build(&self) -> Result<()> {
-        let settings = Settings::get();
+    fn install_ruby_build(&self, pr: Option<&dyn SingleReport>) -> Result<()> {
         debug!(
             "Installing ruby-build to {}",
             self.ruby_build_path().display()
@@ -81,7 +80,7 @@ impl RubyPlugin {
         file::remove_all(&tmp)?;
         file::create_dir_all(tmp.parent().unwrap())?;
         let git = Git::new(tmp.clone());
-        git.clone(&settings.ruby.ruby_build_repo)?;
+        git.clone(&SETTINGS.ruby.ruby_build_repo, pr)?;
 
         cmd!("sh", "install.sh")
             .env("PREFIX", self.ruby_build_path())
@@ -90,7 +89,7 @@ impl RubyPlugin {
         file::remove_all(&tmp)?;
         Ok(())
     }
-    fn update_ruby_build(&self) -> Result<()> {
+    fn update_ruby_build(&self, pr: Option<&dyn SingleReport>) -> Result<()> {
         let _lock = self.lock_build_tool();
         if self.ruby_build_bin().exists() {
             let cur = self.ruby_build_version()?;
@@ -109,11 +108,11 @@ impl RubyPlugin {
             self.ruby_build_path().display()
         );
         file::remove_all(self.ruby_build_path())?;
-        self.install_ruby_build()?;
+        self.install_ruby_build(pr)?;
         Ok(())
     }
 
-    fn install_ruby_install(&self) -> Result<()> {
+    fn install_ruby_install(&self, pr: Option<&dyn SingleReport>) -> Result<()> {
         let settings = Settings::get();
         debug!(
             "Installing ruby-install to {}",
@@ -123,20 +122,21 @@ impl RubyPlugin {
         file::remove_all(&tmp)?;
         file::create_dir_all(tmp.parent().unwrap())?;
         let git = Git::new(tmp.clone());
-        git.clone(&settings.ruby.ruby_install_repo)?;
+        git.clone(&settings.ruby.ruby_install_repo, pr)?;
 
         cmd!("make", "install")
             .env("PREFIX", self.ruby_install_path())
             .dir(&tmp)
+            .stdout_to_stderr()
             .run()?;
         file::remove_all(&tmp)?;
         Ok(())
     }
-    fn update_ruby_install(&self) -> Result<()> {
+    fn update_ruby_install(&self, pr: Option<&dyn SingleReport>) -> Result<()> {
         let _lock = self.lock_build_tool();
         let ruby_install_path = self.ruby_install_path();
         if !ruby_install_path.exists() {
-            self.install_ruby_install()?;
+            self.install_ruby_install(pr)?;
         }
         if self.ruby_install_recently_updated()? {
             return Ok(());
@@ -144,7 +144,9 @@ impl RubyPlugin {
         debug!("Updating ruby-install in {}", ruby_install_path.display());
 
         plugins::core::run_fetch_task_with_timeout(move || {
-            cmd!(&ruby_install_path, "--update").run()?;
+            cmd!(&ruby_install_path, "--update")
+                .stdout_to_stderr()
+                .run()?;
             file::touch_dir(&ruby_install_path)?;
             Ok(())
         })
@@ -177,7 +179,7 @@ impl RubyPlugin {
             if package.is_empty() {
                 continue;
             }
-            pr.set_message(format!("installing default gem: {}", package));
+            pr.set_message(format!("install default gem: {}", package));
             let gem = self.gem_path(tv);
             let mut cmd = CmdLineRunner::new(gem)
                 .with_pr(pr)
@@ -328,13 +330,17 @@ impl Backend for RubyPlugin {
         &self.ba
     }
     fn _list_remote_versions(&self) -> Result<Vec<String>> {
-        if let Err(err) = self.update_build_tool() {
+        if let Err(err) = self.update_build_tool(None) {
             warn!("{err}");
         }
         let ruby_build_bin = self.ruby_build_bin();
         let versions = plugins::core::run_fetch_task_with_timeout(move || {
             let output = cmd!(ruby_build_bin, "--definitions").read()?;
-            let versions = output.split('\n').map(|s| s.to_string()).collect();
+            let versions = output
+                .split('\n')
+                .sorted_by_cached_key(|s| regex!(r#"^\d"#).is_match(s)) // show matz ruby first
+                .map(|s| s.to_string())
+                .collect();
             Ok(versions)
         })?;
         Ok(versions)
@@ -359,23 +365,25 @@ impl Backend for RubyPlugin {
         Ok(v)
     }
 
-    #[requires(matches!(ctx.tv.request, ToolRequest::Version { .. } | ToolRequest::Prefix { .. }), "unsupported tool version request type")]
-    fn install_version_impl(&self, ctx: &InstallContext) -> Result<()> {
-        if let Err(err) = self.update_build_tool() {
+    fn install_version_impl(
+        &self,
+        ctx: &InstallContext,
+        tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
+        if let Err(err) = self.update_build_tool(Some(ctx)) {
             warn!("ruby build tool update error: {err:#}");
         }
-        ctx.pr.set_message("running ruby-build".into());
+        ctx.pr.set_message("ruby-build".into());
         let config = Config::get();
-        self.install_cmd(&config, &ctx.tv, ctx.pr.as_ref())?
-            .execute()?;
+        self.install_cmd(&config, &tv, ctx.pr.as_ref())?.execute()?;
 
-        self.test_ruby(&config, &ctx.tv, ctx.pr.as_ref())?;
-        self.install_rubygems_hook(&ctx.tv)?;
-        self.test_gem(&config, &ctx.tv, ctx.pr.as_ref())?;
-        if let Err(err) = self.install_default_gems(&config, &ctx.tv, ctx.pr.as_ref()) {
+        self.test_ruby(&config, &tv, ctx.pr.as_ref())?;
+        self.install_rubygems_hook(&tv)?;
+        self.test_gem(&config, &tv, ctx.pr.as_ref())?;
+        if let Err(err) = self.install_default_gems(&config, &tv, ctx.pr.as_ref()) {
             warn!("failed to install default ruby gems {err:#}");
         }
-        Ok(())
+        Ok(tv)
     }
 
     fn exec_env(

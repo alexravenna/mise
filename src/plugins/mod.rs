@@ -1,3 +1,4 @@
+use crate::dirs;
 use crate::errors::Error::PluginNotInstalled;
 use crate::plugins::asdf_plugin::AsdfPlugin;
 use crate::plugins::vfox_plugin::VfoxPlugin;
@@ -6,6 +7,7 @@ use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
 use clap::Command;
 use eyre::{eyre, Result};
+use heck::ToKebabCase;
 use once_cell::sync::Lazy;
 use regex::Regex;
 pub use script_manager::{Script, ScriptManager};
@@ -35,9 +37,10 @@ impl PluginType {
     }
 
     pub fn plugin(&self, short: String) -> APlugin {
+        let path = dirs::PLUGINS.join(short.to_kebab_case());
         match self {
-            PluginType::Asdf => Box::new(AsdfPlugin::new(short)),
-            PluginType::Vfox => Box::new(VfoxPlugin::new(short)),
+            PluginType::Asdf => Box::new(AsdfPlugin::new(short, path)),
+            PluginType::Vfox => Box::new(VfoxPlugin::new(short, path)),
         }
     }
 }
@@ -95,6 +98,7 @@ pub trait Plugin: Debug + Send {
     fn external_commands(&self) -> eyre::Result<Vec<Command>> {
         Ok(vec![])
     }
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn execute_external_command(&self, _command: &str, _args: Vec<String>) -> eyre::Result<()> {
         unimplemented!(
             "execute_external_command not implemented for {}",
@@ -145,8 +149,8 @@ mod tests {
         assert_cli!("plugin", "add", "tiny");
         let ba = BackendArg::from("tiny");
         assert_str_eq!(ba.short, "tiny");
-        assert_str_eq!(ba.tool_name, "mise-plugins/mise-tiny");
-        assert_str_eq!(ba.full(), "asdf:mise-plugins/mise-tiny");
+        assert_str_eq!(ba.tool_name, "tiny");
+        assert_str_eq!(ba.full(), "asdf:tiny");
         let backend = AsdfBackend::from_arg("tiny".into());
         let version = backend
             .latest_version(Some("1.0.0".into()))

@@ -12,7 +12,7 @@ use crate::http::HTTP;
 use crate::install_context::InstallContext;
 use crate::toolset::{ToolRequest, ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
-use crate::{cmd, env, file, hash, plugins};
+use crate::{cmd, env, file, plugins};
 use itertools::Itertools;
 use tempfile::tempdir_in;
 use versions::Versioning;
@@ -67,7 +67,7 @@ impl GoPlugin {
             if package.is_empty() {
                 continue;
             }
-            pr.set_message(format!("installing default package: {}", package));
+            pr.set_message(format!("install default package: {}", package));
             let package = if package.contains('@') {
                 package.to_string()
             } else {
@@ -91,7 +91,7 @@ impl GoPlugin {
             .execute()
     }
 
-    fn download(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> eyre::Result<PathBuf> {
+    fn download(&self, tv: &mut ToolVersion, pr: &dyn SingleReport) -> eyre::Result<PathBuf> {
         let settings = Settings::get();
         let filename = format!("go{}.{}-{}.{}", tv.version, platform(), arch(), ext());
         let tarball_url = format!("{}/{}", &settings.go_download_mirror, &filename);
@@ -102,13 +102,12 @@ impl GoPlugin {
                 let checksum_url = format!("{}.sha256", &tarball_url);
                 HTTP.get_text(checksum_url)
             });
-            pr.set_message(format!("downloading {filename}"));
+            pr.set_message(format!("download {filename}"));
             HTTP.download_file(&tarball_url, &tarball_path, Some(pr))?;
 
-            if !settings.go_skip_checksum {
-                pr.set_message(format!("verifying {filename}"));
+            if !settings.go_skip_checksum && !tv.checksums.contains_key(&filename) {
                 let checksum = checksum_handle.join().unwrap()?;
-                hash::ensure_checksum_sha256(&tarball_path, &checksum, Some(pr))?;
+                tv.checksums.insert(filename, format!("sha256:{checksum}"));
             }
             Ok(tarball_path)
         })
@@ -124,7 +123,7 @@ impl GoPlugin {
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        pr.set_message(format!("installing {}", tarball));
+        pr.set_message(format!("extract {}", tarball));
         let tmp_extract_path = tempdir_in(tv.install_path().parent().unwrap())?;
         if cfg!(windows) {
             file::unzip(tarball_path, tmp_extract_path.path())?;
@@ -198,12 +197,17 @@ impl Backend for GoPlugin {
         Ok(vec![".go-version".into()])
     }
 
-    fn install_version_impl(&self, ctx: &InstallContext) -> eyre::Result<()> {
-        let tarball_path = self.download(&ctx.tv, ctx.pr.as_ref())?;
-        self.install(&ctx.tv, ctx.pr.as_ref(), &tarball_path)?;
-        self.verify(&ctx.tv, ctx.pr.as_ref())?;
+    fn install_version_impl(
+        &self,
+        ctx: &InstallContext,
+        mut tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
+        let tarball_path = self.download(&mut tv, ctx.pr.as_ref())?;
+        self.verify_checksum(ctx, &mut tv, &tarball_path)?;
+        self.install(&tv, ctx.pr.as_ref(), &tarball_path)?;
+        self.verify(&tv, ctx.pr.as_ref())?;
 
-        Ok(())
+        Ok(tv)
     }
 
     fn uninstall_version_impl(&self, _pr: &dyn SingleReport, tv: &ToolVersion) -> eyre::Result<()> {
@@ -215,7 +219,7 @@ impl Backend for GoPlugin {
     }
 
     fn list_bin_paths(&self, tv: &ToolVersion) -> eyre::Result<Vec<PathBuf>> {
-        if let ToolRequest::System(..) = tv.request {
+        if let ToolRequest::System { .. } = tv.request {
             return Ok(vec![]);
         }
         // goroot/bin must always be included, irrespective of MISE_GO_SET_GOROOT

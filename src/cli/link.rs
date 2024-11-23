@@ -7,9 +7,8 @@ use eyre::bail;
 use path_absolutize::Absolutize;
 
 use crate::cli::args::ToolArg;
-use crate::config::Config;
-use crate::file;
 use crate::file::{make_symlink, remove_all};
+use crate::{config, file};
 
 /// Symlinks a tool version into mise
 ///
@@ -33,7 +32,6 @@ pub struct Link {
 
 impl Link {
     pub fn run(self) -> Result<()> {
-        let config = Config::try_get()?;
         let version = match self.tool.tvr {
             Some(ref tvr) => tvr.version(),
             None => bail!("must provide a version for {}", self.tool.style()),
@@ -60,13 +58,13 @@ impl Link {
         file::create_dir_all(target.parent().unwrap())?;
         make_symlink(&path, &target)?;
 
-        config.rebuild_shims_and_runtime_symlinks()
+        config::rebuild_shims_and_runtime_symlinks(&[])
     }
 }
 
 static AFTER_LONG_HELP: &str = color_print::cstr!(
     r#"<bold><underline>Examples:</underline></bold>
-    
+
     # build node-20.0.0 with node-build and link it into mise
     $ <bold>node-build 20.0.0 ~/.nodes/20.0.0</bold>
     $ <bold>mise link node@20.0.0 ~/.nodes/20.0.0</bold>
@@ -77,27 +75,3 @@ static AFTER_LONG_HELP: &str = color_print::cstr!(
     $ <bold>mise use node@brew</bold>
 "#
 );
-
-#[cfg(test)]
-mod tests {
-    use crate::file::create_dir_all;
-    use crate::test::reset;
-    use test_log::test;
-
-    #[test]
-    fn test_link() {
-        reset();
-        assert_cli!("install", "tiny@1.0.1", "tiny@2.1.0");
-        assert_cli!("install", "tiny@3.0.1", "tiny@3.1.0");
-        create_dir_all("../data/tmp/tiny").unwrap();
-        assert_cli!("link", "tiny@9.8.7", "../data/tmp/tiny");
-        assert_cli_snapshot!("ls", "tiny", @r"
-        tiny  1.0.1                                       
-        tiny  2.1.0                                       
-        tiny  3.0.1                                       
-        tiny  3.1.0            ~/cwd/.test-tool-versions 3
-        tiny  9.8.7 (symlink)
-        ");
-        assert_cli!("uninstall", "tiny@9.8.7");
-    }
-}

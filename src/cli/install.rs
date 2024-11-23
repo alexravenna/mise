@@ -1,13 +1,10 @@
-use crate::cli::args::{BackendArg, ToolArg};
+use crate::cli::args::ToolArg;
+use crate::config;
 use crate::config::Config;
-use crate::lockfile;
-use crate::toolset::{
-    InstallOptions, ResolveOptions, ToolRequest, ToolSource, ToolVersion, Toolset,
-};
+use crate::toolset::{InstallOptions, ResolveOptions, ToolRequest, ToolSource, Toolset};
 use crate::ui::multi_progress_report::MultiProgressReport;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use itertools::Itertools;
-use std::collections::HashSet;
 
 /// Install a tool version
 ///
@@ -57,19 +54,20 @@ impl Install {
         Ok(())
     }
 
-    fn install_runtimes(&self, config: &Config, runtimes: &[ToolArg]) -> Result<Vec<ToolVersion>> {
+    fn install_runtimes(&self, config: &Config, runtimes: &[ToolArg]) -> Result<()> {
         let mpr = MultiProgressReport::get();
-        let tools: HashSet<BackendArg> = runtimes.iter().map(|ta| ta.ba.clone()).collect();
-        let mut ts = config.get_tool_request_set()?.filter_by_tool(&tools).into();
+        let tools = runtimes.iter().map(|ta| ta.ba.short.clone()).collect();
+        let mut ts = config.get_tool_request_set()?.filter_by_tool(tools).into();
         let tool_versions = self.get_requested_tool_versions(&ts, runtimes)?;
-        if tool_versions.is_empty() {
+        let versions = if tool_versions.is_empty() {
             warn!("no runtimes to install");
             warn!("specify a version with `mise install <PLUGIN>@<VERSION>`");
-            return Ok(vec![]);
-        }
-        let versions = ts.install_versions(config, tool_versions, &mpr, &self.install_opts())?;
-        lockfile::update_lockfiles(&versions).wrap_err("failed to update lockfiles")?;
-        Ok(versions)
+            vec![]
+        } else {
+            ts.install_all_versions(tool_versions, &mpr, &self.install_opts())?
+        };
+        config::rebuild_shims_and_runtime_symlinks(&versions)?;
+        Ok(())
     }
 
     fn install_opts(&self) -> InstallOptions {
@@ -110,7 +108,8 @@ impl Install {
                                 let tvr = ToolRequest::Version {
                                     backend: ta.ba.clone(),
                                     version: "latest".into(),
-                                    options: ta.opts.clone().unwrap_or(Default::default()),
+                                    os: None,
+                                    options: ta.ba.opts(),
                                     source: ToolSource::Argument,
                                 };
                                 requests.push(tvr);
@@ -123,18 +122,19 @@ impl Install {
         Ok(requests)
     }
 
-    fn install_missing_runtimes(&self, config: &Config) -> eyre::Result<Vec<ToolVersion>> {
+    fn install_missing_runtimes(&self, config: &Config) -> eyre::Result<()> {
         let trs = config.get_tool_request_set()?;
         let versions = trs.missing_tools().into_iter().cloned().collect_vec();
-        if versions.is_empty() {
+        let versions = if versions.is_empty() {
             info!("all runtimes are installed");
-            return Ok(vec![]);
-        }
-        let mpr = MultiProgressReport::get();
-        let mut ts = Toolset::from(trs.clone());
-        let versions = ts.install_versions(config, versions, &mpr, &self.install_opts())?;
-        lockfile::update_lockfiles(&versions).wrap_err("failed to update lockfiles")?;
-        Ok(versions)
+            vec![]
+        } else {
+            let mpr = MultiProgressReport::get();
+            let mut ts = Toolset::from(trs.clone());
+            ts.install_all_versions(versions, &mpr, &self.install_opts())?
+        };
+        config::rebuild_shims_and_runtime_symlinks(&versions)?;
+        Ok(())
     }
 }
 

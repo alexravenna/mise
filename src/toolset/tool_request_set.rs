@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{Debug, Display};
 
 use indexmap::IndexMap;
@@ -7,6 +7,7 @@ use itertools::Itertools;
 use crate::cli::args::{BackendArg, ToolArg};
 use crate::config::{Config, Settings};
 use crate::env;
+use crate::registry::REGISTRY;
 use crate::toolset::{ToolRequest, ToolSource};
 
 #[derive(Debug, Default, Clone)]
@@ -43,7 +44,7 @@ impl ToolRequestSet {
         self.tools
             .values()
             .flatten()
-            .filter(|tvr| !tvr.is_installed())
+            .filter(|tr| tr.is_os_supported() && !tr.is_installed())
             .collect()
     }
 
@@ -73,9 +74,15 @@ impl ToolRequestSet {
         })
     }
 
-    pub fn filter_by_tool(&self, tools: &HashSet<BackendArg>) -> Self {
+    pub fn filter_by_tool(&self, mut tools: HashSet<String>) -> ToolRequestSet {
+        // add in the full names so something like cargo:cargo-binstall can be used in place of cargo-binstall
+        for short in tools.clone().iter() {
+            if let Some(rt) = REGISTRY.get(short.as_str()) {
+                tools.extend(rt.backends().iter().map(|s| s.to_string()));
+            }
+        }
         self.iter()
-            .filter(|(fa, ..)| tools.contains(fa))
+            .filter(|(ba, ..)| tools.contains(&ba.short))
             .map(|(fa, trl, ts)| (fa.clone(), trl.clone(), ts.clone()))
             .collect::<ToolRequestSet>()
     }
@@ -84,7 +91,11 @@ impl ToolRequestSet {
 impl Display for ToolRequestSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let versions = self.tools.values().flatten().join(" ");
-        writeln!(f, "ToolRequestSet: {}", versions)?;
+        if versions.is_empty() {
+            write!(f, "ToolRequestSet: <empty>")?;
+        } else {
+            write!(f, "ToolRequestSet: {}", versions)?;
+        }
         Ok(())
     }
 }
@@ -111,14 +122,14 @@ pub struct ToolRequestSetBuilder {
     /// default to latest version if no version is specified (for `mise x`)
     default_to_latest: bool,
     /// tools which will be disabled
-    disable_tools: Vec<BackendArg>,
+    disable_tools: BTreeSet<BackendArg>,
 }
 
 impl ToolRequestSetBuilder {
     pub fn new() -> Self {
         let settings = Settings::get();
         Self {
-            disable_tools: settings.disable_tools.iter().map(|s| s.into()).collect(),
+            disable_tools: settings.disable_tools().iter().map(|s| s.into()).collect(),
             ..Default::default()
         }
     }
@@ -152,8 +163,8 @@ impl ToolRequestSetBuilder {
         Ok(trs)
     }
 
-    fn is_disabled(&self, fa: &BackendArg) -> bool {
-        self.disable_tools.contains(fa)
+    fn is_disabled(&self, ba: &BackendArg) -> bool {
+        !ba.is_os_supported() || self.disable_tools.contains(ba)
     }
 
     fn load_config_files(&self, trs: &mut ToolRequestSet) -> eyre::Result<()> {

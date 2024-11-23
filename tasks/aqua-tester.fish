@@ -1,4 +1,7 @@
-alias m @mise
+#!/usr/bin/env fish
+
+cargo b
+alias m target/debug/mise
 m registry | grep -v '(core|ubi|aqua|vfox):' | awk '{print $1}'> tmp/missing_asdf_tools
 rm -f tmp/pairs
 for tool in (cat tmp/missing_asdf_tools)
@@ -29,6 +32,9 @@ for tool in (cat tmp/pairs | gsort -R)
       continue
     end
     if test "$tool[1]" = "istioctl"
+      continue
+    end
+    if test "$tool[1]" = "om"
       continue
     end
     set -l cmd "m x $tool[2] -- $tool[1] -v"

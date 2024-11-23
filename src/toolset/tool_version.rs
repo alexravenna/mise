@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -21,17 +22,24 @@ use path_absolutize::Absolutize;
 pub struct ToolVersion {
     pub request: ToolRequest,
     pub version: String,
+    pub checksums: BTreeMap<String, String>,
 }
 
 impl ToolVersion {
     pub fn new(request: ToolRequest, version: String) -> Self {
-        ToolVersion { request, version }
+        ToolVersion {
+            request,
+            version,
+            checksums: Default::default(),
+        }
     }
 
     pub fn resolve(request: ToolRequest, opts: &ResolveOptions) -> Result<Self> {
+        trace!("resolving {} {}", &request, opts);
         if opts.use_locked_version {
-            if let Some(v) = request.lockfile_resolve()? {
-                let tv = Self::new(request.clone(), v);
+            if let Some(lt) = request.lockfile_resolve()? {
+                let mut tv = Self::new(request.clone(), lt.version);
+                tv.checksums = lt.checksums;
                 return Ok(tv);
             }
         }
@@ -44,7 +52,7 @@ impl ToolVersion {
         }
         let tv = match request.clone() {
             ToolRequest::Version { version: v, .. } => Self::resolve_version(request, &v, opts)?,
-            ToolRequest::Prefix { prefix, .. } => Self::resolve_prefix(request, &prefix)?,
+            ToolRequest::Prefix { prefix, .. } => Self::resolve_prefix(request, &prefix, opts)?,
             ToolRequest::Sub {
                 sub, orig_version, ..
             } => Self::resolve_sub(request, &sub, &orig_version, opts)?,
@@ -66,7 +74,7 @@ impl ToolVersion {
 
     pub fn install_path(&self) -> PathBuf {
         let pathname = match &self.request {
-            ToolRequest::Path(_, p, ..) => p.to_string_lossy().to_string(),
+            ToolRequest::Path { path: p, .. } => p.to_string_lossy().to_string(),
             _ => self.tv_pathname(),
         };
         let path = self.ba().installs_path.join(pathname);
@@ -121,8 +129,8 @@ impl ToolVersion {
             ToolRequest::Prefix { .. } => self.version.to_string(),
             ToolRequest::Sub { .. } => self.version.to_string(),
             ToolRequest::Ref { ref_: r, .. } => format!("ref-{}", r),
-            ToolRequest::Path(_, p, ..) => format!("path-{}", hash_to_str(p)),
-            ToolRequest::System(..) => "system".to_string(),
+            ToolRequest::Path { path: p, .. } => format!("path-{}", hash_to_str(p)),
+            ToolRequest::System { .. } => "system".to_string(),
         }
         .replace([':', '/'], "-")
     }
@@ -147,7 +155,7 @@ impl ToolVersion {
                 return Self::resolve_path(PathBuf::from(p), &request);
             }
             Some(("prefix", p)) => {
-                return Self::resolve_prefix(request, p);
+                return Self::resolve_prefix(request, p, opts);
             }
             Some((part, v)) if part.starts_with("sub-") => {
                 let sub = part.split_once('-').unwrap().1;
@@ -187,7 +195,7 @@ impl ToolVersion {
         if matches.contains(&v) {
             return build(v);
         }
-        Self::resolve_prefix(request, &v)
+        Self::resolve_prefix(request, &v, opts)
     }
 
     /// resolve a version like `sub-1:12.0.0` which becomes `11.0.0`, `sub-0.1:12.1.0` becomes `12.0.0`
@@ -206,8 +214,14 @@ impl ToolVersion {
         Self::resolve_version(request, &v, opts)
     }
 
-    fn resolve_prefix(request: ToolRequest, prefix: &str) -> Result<Self> {
-        let matches = request.backend()?.list_versions_matching(prefix)?;
+    fn resolve_prefix(request: ToolRequest, prefix: &str, opts: &ResolveOptions) -> Result<Self> {
+        let backend = request.backend()?;
+        if !opts.latest_versions {
+            if let Some(v) = backend.list_installed_versions_matching(prefix)?.last() {
+                return Ok(Self::new(request, v.to_string()));
+            }
+        }
+        let matches = backend.list_versions_matching(prefix)?;
         let v = match matches.last() {
             Some(v) => v,
             None => prefix,
@@ -226,6 +240,7 @@ impl ToolVersion {
             backend: tr.ba().clone(),
             ref_,
             ref_type,
+            os: None,
             options: opts.clone(),
             source: tr.source().clone(),
         };
@@ -235,7 +250,13 @@ impl ToolVersion {
 
     fn resolve_path(path: PathBuf, tr: &ToolRequest) -> Result<ToolVersion> {
         let path = fs::canonicalize(path)?;
-        let request = ToolRequest::Path(tr.ba().clone(), path, tr.source().clone());
+        let request = ToolRequest::Path {
+            backend: tr.ba().clone(),
+            path,
+            source: tr.source().clone(),
+            os: None,
+            options: tr.options().clone(),
+        };
         let version = request.version();
         Ok(Self::new(request, version))
     }
@@ -289,5 +310,18 @@ impl Default for ResolveOptions {
             latest_versions: false,
             use_locked_version: true,
         }
+    }
+}
+
+impl Display for ResolveOptions {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        let mut opts = vec![];
+        if self.latest_versions {
+            opts.push("latest_versions");
+        }
+        if self.use_locked_version {
+            opts.push("use_locked_version");
+        }
+        write!(f, "({})", opts.join(", "))
     }
 }

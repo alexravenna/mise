@@ -53,7 +53,8 @@ use nix::sys::signal::SIGTERM;
 ///     EOF
 ///     $ mise run build
 #[derive(Debug, clap::Args)]
-#[clap(visible_alias = "r", verbatim_doc_comment, disable_help_flag = true, after_long_help = AFTER_LONG_HELP)]
+#[clap(visible_alias = "r", verbatim_doc_comment, disable_help_flag = true, after_long_help = AFTER_LONG_HELP
+)]
 pub struct Run {
     /// Tasks to run
     /// Can specify multiple tasks by separating with `:::`
@@ -112,14 +113,23 @@ pub struct Run {
     /// Shows elapsed time after each task completes
     ///
     /// Default to always show with `MISE_TASK_TIMINGS=1`
-    #[clap(long, alias = "timing", verbatim_doc_comment)]
+    #[clap(long, alias = "timing", verbatim_doc_comment, hide = true)]
     pub timings: bool,
+
+    /// Hides elapsed time after each task completes
+    ///
+    /// Default to always hide with `MISE_TASK_TIMINGS=0`
+    #[clap(long, alias = "no-timing", verbatim_doc_comment)]
+    pub no_timings: bool,
 
     #[clap(skip)]
     pub is_linear: bool,
 
     #[clap(skip)]
     pub failed_tasks: Mutex<Vec<(Task, i32)>>,
+
+    #[clap(skip)]
+    output: TaskOutput,
 }
 
 impl Run {
@@ -192,7 +202,7 @@ impl Run {
 
         let mut ts = ToolsetBuilder::new().with_args(&self.tool).build(&CONFIG)?;
 
-        ts.install_arg_versions(&CONFIG, &InstallOptions::new())?;
+        ts.install_arg_versions(&InstallOptions::new())?;
         ts.notify_if_versions_missing();
         let mut env = ts.env_with_path(&CONFIG)?;
         if let Some(root) = &CONFIG.project_root {
@@ -207,6 +217,9 @@ impl Run {
 
         let num_tasks = tasks.all().count();
         self.is_linear = tasks.is_linear();
+        if let Some(task) = tasks.all().next() {
+            self.output = self.output(task)?;
+        }
 
         let tasks = Mutex::new(tasks);
         let timer = std::time::Instant::now();
@@ -225,9 +238,14 @@ impl Run {
                     if !self.is_stopping() {
                         trace!("running task: {task}");
                         if let Err(err) = self.run_task(&env, &task) {
-                            let prefix = task.estyled_prefix();
-                            eprintln!("{prefix} {} {err:?}", style::ered("ERROR"),);
-                            let _ = tx_err.send((task.clone(), Error::get_exit_status(&err)));
+                            let status = Error::get_exit_status(&err);
+                            if !self.is_stopping() && status.is_none() {
+                                // only show this if it's the first failure, or we haven't killed all the remaining tasks
+                                // otherwise we'll get unhelpful error messages about being killed by mise which we expect
+                                let prefix = task.estyled_prefix();
+                                eprintln!("{prefix} {} {err:?}", style::ered("ERROR"));
+                            }
+                            let _ = tx_err.send((task.clone(), status));
                         }
                     }
                     tasks.lock().unwrap().remove(&task);
@@ -259,7 +277,7 @@ impl Run {
             exit(*status);
         }
 
-        if (self.timings || SETTINGS.task_timings) && num_tasks > 1 {
+        if self.timings() && num_tasks > 1 {
             let msg = format!("Finished in {}", time::format_duration(timer.elapsed()));
             eprintln!("{}", style::edim(msg));
         };
@@ -271,6 +289,10 @@ impl Run {
 
     fn run_task(&self, env: &BTreeMap<String, String>, task: &Task) -> Result<()> {
         let prefix = task.estyled_prefix();
+        if SETTINGS.task_skip.contains(&task.name) {
+            eprintln!("{prefix} skipping task");
+            return Ok(());
+        }
         if !self.force && self.sources_are_fresh(task)? {
             eprintln!("{prefix} sources up-to-date, skipping");
             return Ok(());
@@ -303,7 +325,7 @@ impl Run {
             }
         }
 
-        if self.timings || SETTINGS.task_timings {
+        if self.timings() && (task.file.as_ref().is_some() || !task.run().is_empty()) {
             eprintln!(
                 "{prefix} finished in {}",
                 time::format_duration(timer.elapsed())
@@ -355,6 +377,13 @@ impl Run {
     ) -> (String, Vec<String>) {
         let display = file.display().to_string();
         if file::is_executable(file) && !SETTINGS.use_file_shell_for_executable_tasks {
+            if cfg!(windows) && file.extension().map_or(false, |e| e == "ps1") {
+                let args = vec!["-File".to_string(), display]
+                    .into_iter()
+                    .chain(args.iter().cloned())
+                    .collect_vec();
+                return ("pwsh".to_string(), args);
+            }
             return (display, args.to_vec());
         }
         let default_shell = self.clone_default_file_shell();
@@ -471,7 +500,7 @@ impl Run {
         let program = program.to_executable();
         let mut cmd = CmdLineRunner::new(program.clone()).args(args).envs(env);
         cmd.with_pass_signals();
-        match &self.output(task)? {
+        match self.output {
             TaskOutput::Prefix => cmd = cmd.prefix(format!("{prefix} ")),
             TaskOutput::Interleave => {
                 cmd = cmd
@@ -644,21 +673,30 @@ impl Run {
                 .map(|d| d.join(name))
                 .find(|d| d.is_file() && !file::is_executable(d));
             if let Some(path) = path {
-                warn!(
-                    "no task {} found, but a non-executable file exists at {}",
-                    style::ered(name),
-                    display_path(&path)
-                );
-                let yn = prompt::confirm(
-                    "Mark this file as executable to allow it to be run as a task?",
-                )?;
-                if yn {
-                    file::make_executable(&path)?;
-                    info!("marked as executable, try running this task again");
+                if !cfg!(windows) {
+                    warn!(
+                        "no task {} found, but a non-executable file exists at {}",
+                        style::ered(name),
+                        display_path(&path)
+                    );
+                    let yn = prompt::confirm(
+                        "Mark this file as executable to allow it to be run as a task?",
+                    )?;
+                    if yn {
+                        file::make_executable(&path)?;
+                        info!("marked as executable, try running this task again");
+                    }
                 }
             }
         }
         bail!("no task {} found", style::ered(name));
+    }
+
+    fn timings(&self) -> bool {
+        !self.no_timings
+            && SETTINGS
+                .task_timings
+                .unwrap_or(self.output == TaskOutput::Prefix)
     }
 }
 
@@ -754,9 +792,10 @@ static AFTER_LONG_HELP: &str = color_print::cstr!(
 "#
 );
 
-#[derive(Debug, PartialEq, strum::EnumString)]
+#[derive(Debug, Default, PartialEq, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
 enum TaskOutput {
+    #[default]
     Prefix,
     Interleave,
 }
@@ -764,50 +803,4 @@ enum TaskOutput {
 fn trunc(msg: &str) -> String {
     let msg = msg.lines().next().unwrap_or_default();
     console::truncate_str(msg, *env::TERM_WIDTH, "…").to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use insta::assert_snapshot;
-
-    use crate::file;
-    use crate::test::reset;
-
-    #[test]
-    fn test_task_run() {
-        reset();
-        file::remove_all("test-build-output.txt").unwrap();
-        assert_cli_snapshot!(
-            "r",
-            "filetask",
-            "--user=jdx",
-            ":::",
-            "configtask",
-            "arg3",
-            "arg4"
-        , @"");
-        let body = file::read_to_string("test-build-output.txt").unwrap();
-        assert_snapshot!(body, @"TEST_BUILDSCRIPT_ENV_VAR: VALID");
-    }
-
-    #[test]
-    fn test_task_custom_shell() {
-        reset();
-        file::remove_all("test-build-output.txt").unwrap();
-        assert_cli_snapshot!(
-          "r",
-          "shell",
-      @"");
-        let body = file::read_to_string("test-build-output.txt").unwrap();
-        assert_snapshot!(body, @"using shell bash");
-    }
-
-    #[test]
-    fn test_task_custom_shell_invalid() {
-        reset();
-        assert_cli_snapshot!(
-            "r",
-            "shell invalid",
-        @"mise invalid shell ' ', expected '<program> <argument>' (e.g. sh -c)");
-    }
 }

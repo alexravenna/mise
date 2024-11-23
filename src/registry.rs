@@ -1,86 +1,86 @@
 use crate::backend::backend_type::BackendType;
 use crate::cli::args::BackendArg;
 use crate::config::SETTINGS;
-use itertools::Itertools;
 use once_cell::sync::Lazy;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env::consts::OS;
 use std::iter::Iterator;
 use strum::IntoEnumIterator;
 use url::Url;
 
 // the registry is generated from registry.toml in the project root
-include!(concat!(env!("OUT_DIR"), "/registry.rs"));
+pub static REGISTRY: Lazy<BTreeMap<&'static str, RegistryTool>> =
+    Lazy::new(|| include!(concat!(env!("OUT_DIR"), "/registry.rs")));
 
 #[derive(Debug, Clone)]
 pub struct RegistryTool {
+    pub short: &'static str,
     pub backends: Vec<&'static str>,
+    #[allow(unused)]
     pub aliases: &'static [&'static str],
+    pub test: &'static Option<(&'static str, &'static str)>,
+    pub os: &'static [&'static str],
+    pub depends: &'static [&'static str],
 }
 
-// a rust representation of registry.toml
-pub static REGISTRY: Lazy<BTreeMap<&str, RegistryTool>> = Lazy::new(|| {
-    let mut backend_types = BackendType::iter()
-        .map(|b| b.to_string())
-        .collect::<HashSet<_>>();
-    for backend in &SETTINGS.disable_backends {
-        backend_types.remove(backend);
+impl RegistryTool {
+    pub fn backends(&self) -> Vec<&'static str> {
+        static BACKEND_TYPES: Lazy<HashSet<String>> = Lazy::new(|| {
+            let mut backend_types = BackendType::iter()
+                .map(|b| b.to_string())
+                .collect::<HashSet<_>>();
+            time!("disable_backends");
+            for backend in &SETTINGS.disable_backends {
+                backend_types.remove(backend);
+            }
+            time!("disable_backends");
+            if cfg!(windows) {
+                backend_types.remove("asdf");
+            }
+            backend_types
+        });
+        self.backends
+            .iter()
+            .filter(|full| {
+                full.split(':')
+                    .next()
+                    .map_or(false, |b| BACKEND_TYPES.contains(b))
+            })
+            .copied()
+            .collect()
     }
-    if cfg!(windows) {
-        backend_types.remove("asdf");
-    }
-    if cfg!(unix) && !SETTINGS.experimental {
-        backend_types.remove("aqua");
+
+    pub fn is_supported_os(&self) -> bool {
+        self.os.is_empty() || self.os.contains(&OS)
     }
 
-    let mut registry: BTreeMap<&str, RegistryTool> = _REGISTRY
-        .iter()
-        .map(|(short, backends, aliases)| {
-            let backends = backends
-                .iter()
-                .filter(|full| {
-                    full.split(':')
-                        .next()
-                        .map_or(false, |b| backend_types.contains(b))
-                })
-                .copied()
-                .collect();
-            let tool = RegistryTool { backends, aliases };
-            (*short, tool)
-        })
-        .filter(|(_, tool)| !tool.backends.is_empty())
-        .collect();
+    pub fn ba(&self) -> Option<BackendArg> {
+        self.backends()
+            .first()
+            .map(|f| BackendArg::new(self.short.to_string(), Some(f.to_string())))
+    }
+}
 
-    let aliased = registry
-        .values()
-        .flat_map(|tool| tool.aliases.iter().map(move |alias| (*alias, tool.clone())))
-        .collect_vec();
-
-    registry.extend(aliased);
-
-    registry
-});
-
-pub static REGISTRY_BACKEND_MAP: Lazy<HashMap<&'static str, Vec<BackendArg>>> = Lazy::new(|| {
-    REGISTRY
-        .iter()
-        .map(|(short, tool)| {
-            (
-                *short,
-                tool.backends
-                    .iter()
-                    .map(|f| BackendArg::new(short.to_string(), Some(f.to_string())))
-                    .collect(),
-            )
-        })
-        .collect()
-});
+pub fn shorts_for_full(full: &str) -> &'static Vec<&'static str> {
+    static EMPTY: Vec<&'static str> = vec![];
+    static FULL_TO_SHORT: Lazy<HashMap<&'static str, Vec<&'static str>>> = Lazy::new(|| {
+        let mut map: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+        for (short, rt) in REGISTRY.iter() {
+            for full in rt.backends() {
+                map.entry(full).or_default().push(short);
+            }
+        }
+        map
+    });
+    FULL_TO_SHORT.get(full).unwrap_or(&EMPTY)
+}
 
 pub fn is_trusted_plugin(name: &str, remote: &str) -> bool {
     let normalized_url = normalize_remote(remote).unwrap_or("INVALID_URL".into());
     let is_shorthand = REGISTRY
         .get(name)
-        .and_then(|tool| tool.backends.first())
-        .map(|full| full_to_url(full))
+        .and_then(|tool| tool.backends().first().copied())
+        .map(full_to_url)
         .is_some_and(|s| normalize_remote(&s).unwrap_or_default() == normalized_url);
     let is_mise_url = normalized_url.starts_with("github.com/mise-plugins/");
 
@@ -95,10 +95,21 @@ fn normalize_remote(remote: &str) -> eyre::Result<String> {
 }
 
 pub fn full_to_url(full: &str) -> String {
+    if url_like(full) {
+        return full.to_string();
+    }
     let (_backend, url) = full.split_once(':').unwrap_or(("", full));
-    if url.starts_with("https://") {
+    if url_like(url) {
         url.to_string()
     } else {
         format!("https://github.com/{url}.git")
     }
+}
+
+fn url_like(s: &str) -> bool {
+    s.starts_with("https://")
+        || s.starts_with("http://")
+        || s.starts_with("git@")
+        || s.starts_with("ssh://")
+        || s.starts_with("git://")
 }

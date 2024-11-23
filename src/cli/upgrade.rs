@@ -1,12 +1,10 @@
 use crate::cli::args::ToolArg;
 use crate::config::{config_file, Config};
 use crate::file::display_path;
-use crate::toolset::{
-    install_state, InstallOptions, OutdatedInfo, ResolveOptions, ToolVersion, ToolsetBuilder,
-};
+use crate::toolset::{InstallOptions, OutdatedInfo, ResolveOptions, ToolVersion, ToolsetBuilder};
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
-use crate::{lockfile, runtime_symlinks, shims, ui};
+use crate::{config, ui};
 use demand::DemandOption;
 use eyre::{Context, Result};
 
@@ -88,9 +86,9 @@ impl Upgrade {
         let config_file_updates = outdated
             .iter()
             .filter_map(|o| {
-                if let (Some(path), Some(bump)) = (o.source.path(), &o.bump) {
+                if let (Some(path), Some(_bump)) = (o.source.path(), &o.bump) {
                     match config_file::parse(path) {
-                        Ok(cf) => Some((o, bump.clone(), cf)),
+                        Ok(cf) => Some((o, cf)),
                         Err(e) => {
                             warn!("failed to parse {}: {e}", display_path(path));
                             None
@@ -100,7 +98,7 @@ impl Upgrade {
                     None
                 }
             })
-            .filter(|(o, _bump, cf)| {
+            .filter(|(o, cf)| {
                 if let Ok(trs) = cf.to_tool_request_set() {
                     if let Some(versions) = trs.tools.get(o.tool_request.ba()) {
                         if versions.len() != 1 {
@@ -120,23 +118,24 @@ impl Upgrade {
 
         if self.dry_run {
             for (o, current) in &to_remove {
-                info!("Would uninstall {}@{}", o.name, current);
+                miseprintln!("Would uninstall {}@{}", o.name, current);
             }
             for o in &outdated {
-                info!("Would install {}@{}", o.name, o.latest);
+                miseprintln!("Would install {}@{}", o.name, o.latest);
             }
-            for (o, bump, cf) in &config_file_updates {
-                info!(
+            for (o, cf) in &config_file_updates {
+                miseprintln!(
                     "Would bump {}@{} in {}",
                     o.name,
-                    bump,
+                    o.tool_request.version(),
                     display_path(cf.get_path())
                 );
             }
             return Ok(());
         }
         let opts = InstallOptions {
-            force: false,
+            // TODO: can we remove this without breaking e2e/cli/test_upgrade? it may be causing tools to re-install
+            force: true,
             jobs: self.jobs,
             raw: self.raw,
             resolve_options: ResolveOptions {
@@ -145,23 +144,19 @@ impl Upgrade {
             },
         };
         let new_versions = outdated.iter().map(|o| o.tool_request.clone()).collect();
-        let versions = ts.install_versions(config, new_versions, &mpr, &opts)?;
+        let versions = ts.install_all_versions(new_versions, &mpr, &opts)?;
 
-        for (o, bump, mut cf) in config_file_updates {
-            cf.replace_versions(o.tool_request.ba(), &[(bump, o.tool_request.options())])?;
+        for (o, mut cf) in config_file_updates {
+            cf.replace_versions(o.tool_request.ba(), vec![o.tool_request.clone()])?;
             cf.save()?;
         }
 
         for (o, tv) in to_remove {
-            let pr = mpr.add(&format!("Uninstalling {}@{}", o.name, tv));
+            let pr = mpr.add(&format!("uninstall {}@{}", o.name, tv));
             self.uninstall_old_version(&o.tool_version, pr.as_ref())?;
         }
 
-        install_state::reset();
-        lockfile::update_lockfiles(&versions).wrap_err("failed to update lockfiles")?;
-        let ts = ToolsetBuilder::new().with_args(&self.tool).build(config)?;
-        shims::reshim(&ts, false).wrap_err("failed to reshim")?;
-        runtime_symlinks::rebuild(config)?;
+        config::rebuild_shims_and_runtime_symlinks(&versions)?;
         Ok(())
     }
 

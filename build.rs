@@ -1,7 +1,7 @@
 use heck::ToUpperCamelCase;
 use indexmap::IndexMap;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 fn main() {
@@ -14,14 +14,13 @@ fn main() {
 
     codegen_settings();
     codegen_registry();
+    codegen_aqua();
 }
 
 fn codegen_registry() {
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("registry.rs");
-    let mut lines = vec![r#"
-const _REGISTRY: &[(&str, &[&str], &[&str])] = &["#
-        .to_string()];
+    let mut lines = vec!["[".to_string()];
 
     let registry: toml::Table = fs::read_to_string("registry.toml")
         .unwrap()
@@ -41,6 +40,13 @@ const _REGISTRY: &[(&str, &[&str], &[&str])] = &["#
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect::<Vec<_>>();
+        let test = info.get("test").map(|t| {
+            let t = t.as_array().unwrap();
+            (
+                t[0].as_str().unwrap().to_string(),
+                t[1].as_str().unwrap().to_string(),
+            )
+        });
         let backends = info.get("backends").unwrap().as_array().unwrap();
         let mut fulls = vec![];
         for backend in backends {
@@ -59,17 +65,58 @@ const _REGISTRY: &[(&str, &[&str], &[&str])] = &["#
                 _ => panic!("Unknown backend type"),
             }
         }
-        lines.push(format!(
-            r#"    ("{short}", &["{fulls}"], &[{aliases}]),"#,
-            fulls = fulls.join("\", \""),
+        let os = info
+            .get("os")
+            .map(|os| {
+                let os = os.as_array().unwrap();
+                let mut os = os
+                    .iter()
+                    .map(|o| o.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>();
+                os.sort();
+                os
+            })
+            .unwrap_or_default();
+        let depends = info
+            .get("depends")
+            .map(|depends| {
+                let depends = depends.as_array().unwrap();
+                let mut depends = depends
+                    .iter()
+                    .map(|d| d.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>();
+                depends.sort();
+                depends
+            })
+            .unwrap_or_default();
+        let rt = format!(
+            r#"RegistryTool{{short: "{short}", backends: vec!["{backends}"], aliases: &[{aliases}], test: &{test}, os: &[{os}], depends: &[{depends}]}}"#,
+            backends = fulls.join("\", \""),
             aliases = aliases
                 .iter()
                 .map(|a| format!("\"{a}\""))
                 .collect::<Vec<_>>()
                 .join(", "),
-        ));
+            test = test
+                .map(|(t, v)| format!("Some((\"{t}\", \"{v}\"))", t = t, v = v))
+                .unwrap_or("None".to_string()),
+            os = os
+                .iter()
+                .map(|o| format!("\"{o}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            depends = depends
+                .iter()
+                .map(|d| format!("\"{d}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        lines.push(format!(r#"    ("{short}", {rt}),"#));
+        for alias in aliases {
+            lines.push(format!(r#"    ("{alias}", {rt}),"#));
+        }
     }
-    lines.push(r#"];"#.to_string());
+    lines.push(r#"].into()"#.to_string());
 
     fs::write(&dest_path, lines.join("\n")).unwrap();
 }
@@ -208,4 +255,53 @@ pub static SETTINGS_META: Lazy<IndexMap<String, SettingsMeta>> = Lazy::new(|| {
     );
 
     fs::write(&dest_path, lines.join("\n")).unwrap();
+}
+
+// pub static AQUA_STANDARD_REGISTRY_FILES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
+//     include!(concat!(env!("OUT_DIR"), "/aqua_standard_registry.rs"));
+// });
+
+fn codegen_aqua() {
+    let out_dir = env::var_os("OUT_DIR").unwrap();
+    let dest_path = Path::new(&out_dir).join("aqua_standard_registry.rs");
+    let mut lines = vec!["[".to_string()];
+    for (k, v) in aqua_registries(&registry_dir()).unwrap_or_default() {
+        lines.push(format!(r####"    ("{k}", r###"{v}"###),"####));
+    }
+    lines.push("].into()".to_string());
+    fs::write(&dest_path, lines.join("\n")).unwrap();
+}
+
+fn ls(path: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    fs::read_dir(path)?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect()
+}
+
+fn aqua_registries(d: &Path) -> Result<Vec<(String, String)>, std::io::Error> {
+    let mut registries = vec![];
+    for f in ls(d)? {
+        if f.is_dir() {
+            registries.extend(aqua_registries(&f)?);
+        } else if f.file_name() == Some("registry.yaml".as_ref()) {
+            registries.push((
+                f.parent()
+                    .unwrap()
+                    .strip_prefix(registry_dir())
+                    .unwrap()
+                    .to_string_lossy()
+                    .split(std::path::MAIN_SEPARATOR_STR)
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                fs::read_to_string(&f).unwrap(),
+            ));
+        }
+    }
+    Ok(registries)
+}
+
+fn registry_dir() -> PathBuf {
+    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("aqua-registry")
+        .join("pkgs")
 }

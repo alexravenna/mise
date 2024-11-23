@@ -1,6 +1,6 @@
 use crate::config::Settings;
 use crate::ui::ctrlc;
-use crate::{eager, logger, migrate, shims};
+use crate::{logger, migrate, shims};
 use clap::{FromArgMatches, Subcommand};
 use color_eyre::Result;
 use indoc::indoc;
@@ -49,6 +49,8 @@ mod settings;
 mod shell;
 mod sync;
 mod tasks;
+mod test_tool;
+mod tool;
 mod trust;
 mod uninstall;
 mod unset;
@@ -62,7 +64,8 @@ mod r#which;
 
 pub struct Cli {}
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, strum::Display)]
+#[strum(serialize_all = "kebab-case")]
 pub enum Commands {
     Activate(activate::Activate),
     Alias(alias::Alias),
@@ -101,6 +104,8 @@ pub enum Commands {
     Shell(shell::Shell),
     Sync(sync::Sync),
     Tasks(tasks::Tasks),
+    TestTool(test_tool::TestTool),
+    Tool(tool::Tool),
     Trust(trust::Trust),
     Uninstall(uninstall::Uninstall),
     Unset(unset::Unset),
@@ -159,6 +164,8 @@ impl Commands {
             Self::Shell(cmd) => cmd.run(),
             Self::Sync(cmd) => cmd.run(),
             Self::Tasks(cmd) => cmd.run(),
+            Self::TestTool(cmd) => cmd.run(),
+            Self::Tool(cmd) => cmd.run(),
             Self::Trust(cmd) => cmd.run(),
             Self::Uninstall(cmd) => cmd.run(),
             Self::Unset(cmd) => cmd.run(),
@@ -203,37 +210,50 @@ pub static CLI: Lazy<clap::Command> = Lazy::new(|| {
 impl Cli {
     pub fn run(args: &Vec<String>) -> Result<()> {
         crate::env::ARGS.write().unwrap().clone_from(args);
-        time!("run init");
-        shims::handle_shim()?;
-        time!("run handle_shim");
+        measure!("hande_shim", { shims::handle_shim() })?;
         ctrlc::init();
         version::print_version_if_requested(args)?;
 
-        let matches = CLI.clone().try_get_matches_from(args).unwrap_or_else(|_| {
-            CLI.clone()
-                .subcommands(external::commands())
-                .get_matches_from(args)
+        let matches = measure!("pre_settings", { Self::pre_settings(args) })?;
+        measure!("add_cli_matches", { Settings::add_cli_matches(&matches) });
+        measure!("settings", {
+            let _ = Settings::try_get();
         });
-        time!("run get_matches_from");
-        Settings::add_cli_matches(&matches);
-        time!("run add_cli_matches");
-        logger::init();
-        time!("run logger init");
-        migrate::run();
-        eager::post_settings();
+        measure!("logger", { logger::init() });
+        measure!("migrate", { migrate::run() });
         if let Err(err) = crate::cache::auto_prune() {
             warn!("auto_prune failed: {err:?}");
         }
 
         debug!("ARGS: {}", &args.join(" "));
-        time!("run");
         match Commands::from_arg_matches(&matches) {
-            Ok(cmd) => cmd.run(),
+            Ok(cmd) => measure!("run {cmd}", { cmd.run() }),
             Err(err) => matches
                 .subcommand()
                 .ok_or(err)
                 .map(|(command, sub_m)| external::execute(&command.into(), sub_m))?,
         }
+    }
+
+    fn pre_settings(args: &Vec<String>) -> Result<clap::ArgMatches> {
+        let mut results = vec![];
+        let mut matches = None;
+        rayon::scope(|r| {
+            r.spawn(|_| {
+                measure!("install_state", {
+                    results.push(crate::install_state::init())
+                });
+            });
+            measure!("get_matches_from", {
+                matches = Some(CLI.clone().try_get_matches_from(args).unwrap_or_else(|_| {
+                    CLI.clone()
+                        .subcommands(external::commands())
+                        .get_matches_from(args)
+                }));
+            });
+        });
+        results.into_iter().try_for_each(|r| r)?;
+        Ok(matches.unwrap())
     }
 }
 
@@ -274,7 +294,7 @@ static AFTER_LONG_HELP: &str = color_print::cstr!(
     $ <bold>mise watch build</bold>               Run `build` tasks repeatedly when files change
 
     $ <bold>mise settings</bold>                  Show settings in use
-    $ <bold>mise settings set color 0</bold>      Disable color by modifying global config file
+    $ <bold>mise settings color=0</bold>          Disable color by modifying global config file
 "#
 );
 

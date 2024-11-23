@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use contracts::requires;
 use eyre::Result;
 use itertools::Itertools;
 use versions::Versioning;
@@ -9,12 +8,11 @@ use crate::backend::Backend;
 use crate::cli::args::BackendArg;
 use crate::cli::version::{ARCH, OS};
 use crate::cmd::CmdLineRunner;
-use crate::github::GithubRelease;
-use crate::http::{HTTP, HTTP_FETCH};
+use crate::http::HTTP;
 use crate::install_context::InstallContext;
-use crate::toolset::{ToolRequest, ToolVersion};
+use crate::toolset::ToolVersion;
 use crate::ui::progress_report::SingleReport;
-use crate::{file, plugins};
+use crate::{file, github, plugins};
 
 #[derive(Debug)]
 pub struct BunPlugin {
@@ -29,12 +27,12 @@ impl BunPlugin {
     }
 
     fn bun_bin(&self, tv: &ToolVersion) -> PathBuf {
-        tv.install_path().join("bin/bun")
+        tv.install_path().join("bin").join(bun_bin_name())
     }
 
-    fn test_bun(&self, ctx: &InstallContext) -> Result<()> {
+    fn test_bun(&self, ctx: &InstallContext, tv: &ToolVersion) -> Result<()> {
         ctx.pr.set_message("bun -v".into());
-        CmdLineRunner::new(self.bun_bin(&ctx.tv))
+        CmdLineRunner::new(self.bun_bin(tv))
             .with_pr(ctx.pr.as_ref())
             .arg("-v")
             .execute()
@@ -50,32 +48,33 @@ impl BunPlugin {
         let filename = url.split('/').last().unwrap();
         let tarball_path = tv.download_path().join(filename);
 
-        pr.set_message(format!("downloading {filename}"));
+        pr.set_message(format!("download {filename}"));
         HTTP.download_file(&url, &tarball_path, Some(pr))?;
 
         Ok(tarball_path)
     }
 
-    fn install(&self, ctx: &InstallContext, tarball_path: &Path) -> Result<()> {
+    fn install(&self, ctx: &InstallContext, tv: &ToolVersion, tarball_path: &Path) -> Result<()> {
         let filename = tarball_path.file_name().unwrap().to_string_lossy();
-        ctx.pr.set_message(format!("installing {filename}"));
-        file::remove_all(ctx.tv.install_path())?;
-        file::create_dir_all(ctx.tv.install_path().join("bin"))?;
-        file::unzip(tarball_path, &ctx.tv.download_path())?;
+        ctx.pr.set_message(format!("extract {filename}"));
+        file::remove_all(tv.install_path())?;
+        file::create_dir_all(tv.install_path().join("bin"))?;
+        file::unzip(tarball_path, &tv.download_path())?;
         file::rename(
-            ctx.tv
-                .download_path()
+            tv.download_path()
                 .join(format!("bun-{}-{}", os(), arch()))
-                .join("bun"),
-            self.bun_bin(&ctx.tv),
+                .join(bun_bin_name()),
+            self.bun_bin(tv),
         )?;
-        file::make_executable(self.bun_bin(&ctx.tv))?;
-        file::make_symlink(Path::new("./bun"), &ctx.tv.install_path().join("bin/bunx"))?;
+        if cfg!(unix) {
+            file::make_executable(self.bun_bin(tv))?;
+            file::make_symlink(Path::new("./bun"), &tv.install_path().join("bin/bunx"))?;
+        }
         Ok(())
     }
 
-    fn verify(&self, ctx: &InstallContext) -> Result<()> {
-        self.test_bun(ctx)
+    fn verify(&self, ctx: &InstallContext, tv: &ToolVersion) -> Result<()> {
+        self.test_bun(ctx, tv)
     }
 }
 
@@ -85,9 +84,7 @@ impl Backend for BunPlugin {
     }
 
     fn _list_remote_versions(&self) -> Result<Vec<String>> {
-        let releases: Vec<GithubRelease> =
-            HTTP_FETCH.json("https://api.github.com/repos/oven-sh/bun/releases?per_page=100")?;
-        let versions = releases
+        let versions = github::list_releases("oven-sh/bun")?
             .into_iter()
             .map(|r| r.tag_name)
             .filter_map(|v| v.strip_prefix("bun-v").map(|v| v.to_string()))
@@ -101,13 +98,17 @@ impl Backend for BunPlugin {
         Ok(vec![".bun-version".into()])
     }
 
-    #[requires(matches!(ctx.tv.request, ToolRequest::Version { .. } | ToolRequest::Prefix { .. }), "unsupported tool version request type")]
-    fn install_version_impl(&self, ctx: &InstallContext) -> Result<()> {
-        let tarball_path = self.download(&ctx.tv, ctx.pr.as_ref())?;
-        self.install(ctx, &tarball_path)?;
-        self.verify(ctx)?;
+    fn install_version_impl(
+        &self,
+        ctx: &InstallContext,
+        mut tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
+        let tarball_path = self.download(&tv, ctx.pr.as_ref())?;
+        self.verify_checksum(ctx, &mut tv, &tarball_path)?;
+        self.install(ctx, &tv, &tarball_path)?;
+        self.verify(ctx, &tv)?;
 
-        Ok(())
+        Ok(tv)
     }
 }
 
@@ -129,8 +130,20 @@ fn arch() -> &'static str {
             "x64-baseline"
         }
     } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
+        if cfg!(windows) {
+            "x64"
+        } else {
+            "aarch64"
+        }
     } else {
         &ARCH
+    }
+}
+
+fn bun_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "bun.exe"
+    } else {
+        "bun"
     }
 }

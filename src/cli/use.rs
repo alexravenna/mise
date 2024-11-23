@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use console::style;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use itertools::Itertools;
+use path_absolutize::Absolutize;
 
 use crate::cli::args::{BackendArg, ToolArg};
 use crate::config::config_file::ConfigFile;
@@ -11,9 +12,11 @@ use crate::env::{
     MISE_DEFAULT_CONFIG_FILENAME, MISE_DEFAULT_TOOL_VERSIONS_FILENAME, MISE_GLOBAL_CONFIG_FILE,
 };
 use crate::file::{display_path, FindUp};
-use crate::toolset::{InstallOptions, ToolRequest, ToolSource, ToolVersion, ToolsetBuilder};
+use crate::toolset::{
+    InstallOptions, ResolveOptions, ToolRequest, ToolSource, ToolVersion, ToolsetBuilder,
+};
 use crate::ui::multi_progress_report::MultiProgressReport;
-use crate::{env, file, lockfile};
+use crate::{config, env, file};
 
 /// Installs a tool and adds the version it to mise.toml.
 ///
@@ -92,42 +95,72 @@ impl Use {
         let config = Config::try_get()?;
         let mut ts = ToolsetBuilder::new().build(&config)?;
         let mpr = MultiProgressReport::get();
+        let mut cf = self.get_config_file()?;
+        let mut resolve_options = ResolveOptions {
+            latest_versions: false,
+            use_locked_version: true,
+        };
         let versions: Vec<_> = self
             .tool
             .iter()
             .cloned()
             .map(|t| match t.tvr {
-                Some(tvr) => Ok(tvr),
-                None => ToolRequest::new(t.ba, "latest", ToolSource::Argument),
+                Some(tvr) => {
+                    if tvr.version() == "latest" {
+                        // user specified `@latest` so we should resolve the latest version
+                        // TODO: this should only happen on this tool, not all of them
+                        resolve_options.latest_versions = true;
+                        resolve_options.use_locked_version = false;
+                    }
+                    Ok(tvr)
+                }
+                None => ToolRequest::new(
+                    t.ba,
+                    "latest",
+                    ToolSource::MiseToml(cf.get_path().to_path_buf()),
+                ),
             })
             .collect::<Result<_>>()?;
-        let mut versions = ts.install_versions(
-            &config,
+        let mut versions = ts.install_all_versions(
             versions.clone(),
             &mpr,
             &InstallOptions {
                 force: self.force,
                 jobs: self.jobs,
                 raw: self.raw,
-                resolve_options: Default::default(),
+                resolve_options,
             },
         )?;
 
-        let mut cf = self.get_config_file()?;
         let pin = self.pin || !self.fuzzy && (SETTINGS.pin || SETTINGS.asdf_compat);
 
-        for (fa, tvl) in &versions.iter().chunk_by(|tv| tv.ba()) {
+        for (ba, tvl) in &versions.iter().chunk_by(|tv| tv.ba()) {
             let versions: Vec<_> = tvl
                 .into_iter()
                 .map(|tv| {
+                    let mut request = tv.request.clone();
                     if pin {
-                        (tv.version.clone(), tv.request.options())
-                    } else {
-                        (tv.request.version(), tv.request.options())
+                        if let ToolRequest::Version {
+                            version: _version,
+                            source,
+                            os,
+                            options,
+                            backend,
+                        } = request
+                        {
+                            request = ToolRequest::Version {
+                                version: tv.version.clone(),
+                                source,
+                                os,
+                                options,
+                                backend,
+                            };
+                        }
                     }
+                    request
                 })
                 .collect();
-            cf.replace_versions(fa, &versions)?;
+            cf.replace_versions(ba, versions)?;
         }
 
         if self.global {
@@ -143,7 +176,7 @@ impl Use {
             tv.request.set_source(cf.source());
         }
 
-        lockfile::update_lockfiles(&versions).wrap_err("failed to update lockfiles")?;
+        config::rebuild_shims_and_runtime_symlinks(&versions)?;
 
         self.render_success_message(cf.as_ref(), &versions)?;
         Ok(())
@@ -153,7 +186,7 @@ impl Use {
         let cwd = env::current_dir()?;
         let path = if let Some(env) = &*env::MISE_PROFILE {
             config_file_from_dir(&cwd.join(format!("mise.{env}.toml")))
-        } else if self.global {
+        } else if self.global || env::in_home_dir() {
             MISE_GLOBAL_CONFIG_FILE.clone()
         } else if let Some(env) = &self.env {
             let p = cwd.join(format!(".mise.{env}.toml"));
@@ -163,7 +196,7 @@ impl Use {
                 cwd.join(format!("mise.{env}.toml"))
             }
         } else if let Some(p) = &self.path {
-            let from_dir = config_file_from_dir(p);
+            let from_dir = config_file_from_dir(p).absolutize()?.to_path_buf();
             if from_dir.starts_with(&cwd) {
                 from_dir
             } else {

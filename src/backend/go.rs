@@ -7,7 +7,7 @@ use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Settings, SETTINGS};
 use crate::install_context::InstallContext;
-use crate::toolset::ToolRequest;
+use crate::toolset::ToolVersion;
 
 #[derive(Debug)]
 pub struct GoBackend {
@@ -24,17 +24,17 @@ impl Backend for GoBackend {
         &self.ba
     }
 
-    fn get_dependencies(&self, _tvr: &ToolRequest) -> eyre::Result<Vec<BackendArg>> {
-        Ok(vec!["go".into()])
+    fn get_dependencies(&self) -> eyre::Result<Vec<&str>> {
+        Ok(vec!["go"])
     }
 
     fn _list_remote_versions(&self) -> eyre::Result<Vec<String>> {
         self.remote_version_cache
             .get_or_try_init(|| {
-                let mut mod_path = Some(self.name());
+                let mut mod_path = Some(self.tool_name());
 
                 while let Some(cur_mod_path) = mod_path {
-                    let res = cmd!("go", "list", "-m", "-versions", "-json", cur_mod_path)
+                    let res = cmd!("go", "list", "-m", "-versions", "-json", &cur_mod_path)
                         .full_env(self.dependency_env()?)
                         .read();
                     if let Ok(raw) = res {
@@ -58,24 +58,28 @@ impl Backend for GoBackend {
             .cloned()
     }
 
-    fn install_version_impl(&self, ctx: &InstallContext) -> eyre::Result<()> {
+    fn install_version_impl(
+        &self,
+        ctx: &InstallContext,
+        tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
         let settings = Settings::get();
         settings.ensure_experimental("go backend")?;
 
-        let version = if ctx.tv.version.starts_with("v") {
+        let version = if tv.version.starts_with("v") {
             warn!("usage of a 'v' prefix in the version is discouraged");
-            ctx.tv.version.to_string().replacen("v", "", 1)
+            tv.version.to_string().replacen("v", "", 1)
         } else {
-            ctx.tv.version.to_string()
+            tv.version.to_string()
         };
 
         let install = |v| {
             CmdLineRunner::new("go")
                 .arg("install")
-                .arg(format!("{}@{v}", self.name()))
+                .arg(format!("{}@{v}", self.tool_name()))
                 .with_pr(ctx.pr.as_ref())
                 .envs(self.dependency_env()?)
-                .env("GOBIN", ctx.tv.install_path().join("bin"))
+                .env("GOBIN", tv.install_path().join("bin"))
                 .execute()
         };
 
@@ -84,7 +88,7 @@ impl Backend for GoBackend {
             install(version)?;
         }
 
-        Ok(())
+        Ok(tv)
     }
 }
 
@@ -101,11 +105,8 @@ impl GoBackend {
     }
 }
 
-fn trim_after_last_slash(s: &str) -> Option<&str> {
-    match s.rsplit_once('/') {
-        Some((new_path, _)) => Some(new_path),
-        None => None,
-    }
+fn trim_after_last_slash(s: String) -> Option<String> {
+    s.rsplit_once('/').map(|(new_path, _)| new_path.to_string())
 }
 
 #[derive(Debug, serde::Deserialize)]

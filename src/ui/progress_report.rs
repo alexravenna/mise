@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -12,6 +13,7 @@ pub trait SingleReport: Send + Sync {
     fn inc(&self, _delta: u64) {}
     fn set_position(&self, _delta: u64) {}
     fn set_length(&self, _length: u64) {}
+    fn abandon(&self) {}
     fn finish(&self) {}
     fn finish_with_message(&self, _message: String) {}
 }
@@ -109,6 +111,9 @@ impl SingleReport for ProgressReport {
         self.pb.disable_steady_tick();
         self.pb.set_length(length);
     }
+    fn abandon(&self) {
+        self.pb.abandon();
+    }
     fn finish(&self) {
         self.pb.set_style(SUCCESS_TEMPLATE.clone());
         self.pb
@@ -135,6 +140,7 @@ impl SingleReport for QuietReport {}
 
 pub struct VerboseReport {
     prefix: String,
+    prev_message: Mutex<String>,
     pad: usize,
 }
 
@@ -142,6 +148,7 @@ impl VerboseReport {
     pub fn new(prefix: String) -> VerboseReport {
         VerboseReport {
             prefix,
+            prev_message: Mutex::new("".to_string()),
             pad: *LONGEST_PLUGIN_NAME,
         }
     }
@@ -152,8 +159,13 @@ impl SingleReport for VerboseReport {
         eprintln!("{message}");
     }
     fn set_message(&self, message: String) {
+        let mut prev_message = self.prev_message.lock().unwrap();
+        if *prev_message == message {
+            return;
+        }
         let prefix = pad_prefix(self.pad, &self.prefix);
         log::info!("{prefix} {message}");
+        *prev_message = message.clone();
     }
     fn finish(&self) {
         self.finish_with_message(style::egreen("done").to_string());

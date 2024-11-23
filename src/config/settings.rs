@@ -1,6 +1,6 @@
 use crate::config::{system_config_files, DEFAULT_CONFIG_FILENAMES};
 use crate::file::FindUp;
-use crate::{config, dirs, eager, env, file};
+use crate::{config, dirs, env, file};
 #[allow(unused_imports)]
 use confique::env::parse::{list_by_colon, list_by_comma};
 use confique::{Config, Partial};
@@ -71,6 +71,10 @@ static DEFAULT_SETTINGS: Lazy<SettingsPartial> = Lazy::new(|| {
     s
 });
 
+// pub fn is_loaded() -> bool {
+//     BASE_SETTINGS.read().unwrap().is_some()
+// }
+
 #[derive(Serialize, Deserialize)]
 pub struct SettingsFile {
     #[serde(default)]
@@ -85,6 +89,7 @@ impl Settings {
         if let Some(settings) = BASE_SETTINGS.read().unwrap().as_ref() {
             return Ok(settings.clone());
         }
+        time!("try_get");
 
         // Initial pass to obtain cd option
         let mut sb = Self::builder()
@@ -153,6 +158,7 @@ impl Settings {
         settings.set_hidden_configs();
         let settings = Arc::new(settings);
         *BASE_SETTINGS.write().unwrap() = Some(settings.clone());
+        time!("try_get done");
         trace!("Settings: {:#?}", settings);
         Ok(settings)
     }
@@ -265,18 +271,15 @@ impl Settings {
         Self::from_file(settings_file)
     }
 
-    fn parse_settings_file(path: &PathBuf) -> Result<SettingsPartial> {
+    pub fn parse_settings_file(path: &PathBuf) -> Result<SettingsPartial> {
         let raw = file::read_to_string(path)?;
         let settings_file: SettingsFile = toml::from_str(&raw)?;
-
-        // eagerly parse the file as a config file in the background for later
-        eager::CONFIG_FILES.lock().unwrap().push(path.clone());
 
         Ok(settings_file.settings)
     }
 
     fn all_settings_files() -> Vec<SettingsPartial> {
-        config::load_config_paths(&DEFAULT_CONFIG_FILENAMES)
+        config::load_config_paths(&DEFAULT_CONFIG_FILENAMES, false)
             .iter()
             .filter(|p| {
                 let filename = p.file_name().unwrap_or_default().to_string_lossy();
@@ -297,7 +300,7 @@ impl Settings {
             .collect()
     }
 
-    pub fn from_file(path: &PathBuf) -> Result<SettingsPartial> {
+    fn from_file(path: &PathBuf) -> Result<SettingsPartial> {
         let raw = file::read_to_string(path)?;
         let settings: SettingsPartial = toml::from_str(&raw)?;
         Ok(settings)
@@ -326,13 +329,16 @@ impl Settings {
 
     pub fn ensure_experimental(&self, what: &str) -> Result<()> {
         if !self.experimental {
-            bail!("{what} is experimental. Enable it with `mise settings set experimental true`");
+            bail!("{what} is experimental. Enable it with `mise settings experimental=true`");
         }
         Ok(())
     }
 
     pub fn trusted_config_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
-        self.trusted_config_paths.iter().map(file::replace_path)
+        self.trusted_config_paths
+            .iter()
+            .filter(|p| !p.to_string_lossy().is_empty())
+            .map(file::replace_path)
     }
 
     pub fn global_tools_file(&self) -> PathBuf {
@@ -392,6 +398,19 @@ impl Settings {
 
     pub fn log_level(&self) -> log::LevelFilter {
         self.log_level.parse().unwrap_or(log::LevelFilter::Info)
+    }
+
+    pub fn disable_tools(&self) -> BTreeSet<String> {
+        self.disable_tools
+            .iter()
+            .map(|t| t.trim().to_string())
+            .collect()
+    }
+
+    pub fn partial_as_dict(partial: &SettingsPartial) -> eyre::Result<toml::Table> {
+        let s = toml::to_string(partial)?;
+        let table = toml::from_str(&s)?;
+        Ok(table)
     }
 }
 

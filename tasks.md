@@ -1,3 +1,7 @@
+## `aqua-tester.fish`
+
+- **Usage**: `aqua-tester.fish`
+
 ## `build`
 
 - **Usage**: `build`
@@ -45,22 +49,44 @@ run mise inside of development docker container
 
 run a command inside of development docker container
 
+## `docs`
+
+- Depends: docs:setup
+
+- **Usage**: `docs`
+
+## `docs:build`
+
+- Depends: docs:setup
+
+- **Usage**: `docs:build`
+
+## `docs:release`
+
+- Depends: docs:build
+
+- **Usage**: `docs:release`
+
+## `docs:setup`
+
+- **Usage**: `docs:setup`
+
 ## `filetask`
 
-- **Usage**: `filetask [-f --force] [-u --user <user>] <file> <arg_with_default>`
+- **Usage**: `filetask [-f --force] [-u --user <user>] [file] [arg_with_default]`
 - **Aliases**: `ft`
 
 This is a test build script
 
 ### Arguments
 
-#### `<file>`
+#### `[file]`
 
 The file to write
 
 **Default:** `file.txt`
 
-#### `<arg_with_default>`
+#### `[arg_with_default]`
 
 An arg with a default
 
@@ -137,10 +163,6 @@ User to run as
 
 - **Usage**: `release`
 
-## `release-docs`
-
-- **Usage**: `release-docs`
-
 ## `release-plz`
 
 - **Usage**: `release-plz`
@@ -154,13 +176,11 @@ User to run as
 
 ## `render:completions`
 
-- Depends: build, render:usage
+- Depends: build
 
 - **Usage**: `render:completions`
 
 ## `render:fig`
-
-- Depends: build, render:usage, render:completions
 
 - **Usage**: `render:fig`
 

@@ -7,6 +7,7 @@ use xx::file;
 
 use crate::backend::ABackend;
 use crate::cli::args::BackendArg;
+use crate::lockfile::LockfileTool;
 use crate::runtime_symlinks::is_runtime_symlink;
 use crate::toolset::tool_version::ResolveOptions;
 use crate::toolset::{ToolSource, ToolVersion, ToolVersionOptions};
@@ -19,12 +20,14 @@ pub enum ToolRequest {
         version: String,
         options: ToolVersionOptions,
         source: ToolSource,
+        os: Option<Vec<String>>,
     },
     Prefix {
         backend: BackendArg,
         prefix: String,
         options: ToolVersionOptions,
         source: ToolSource,
+        os: Option<Vec<String>>,
     },
     Ref {
         backend: BackendArg,
@@ -32,15 +35,29 @@ pub enum ToolRequest {
         ref_type: String,
         options: ToolVersionOptions,
         source: ToolSource,
+        os: Option<Vec<String>>,
     },
     Sub {
         backend: BackendArg,
         sub: String,
         orig_version: String,
+        options: ToolVersionOptions,
         source: ToolSource,
+        os: Option<Vec<String>>,
     },
-    Path(BackendArg, PathBuf, ToolSource),
-    System(BackendArg, ToolSource),
+    Path {
+        backend: BackendArg,
+        path: PathBuf,
+        options: ToolVersionOptions,
+        source: ToolSource,
+        os: Option<Vec<String>>,
+    },
+    System {
+        backend: BackendArg,
+        source: ToolSource,
+        options: ToolVersionOptions,
+        os: Option<Vec<String>>,
+    },
 }
 
 impl ToolRequest {
@@ -53,30 +70,46 @@ impl ToolRequest {
             Some((ref_type @ ("ref" | "tag" | "branch" | "rev"), r)) => Self::Ref {
                 ref_: r.to_string(),
                 ref_type: ref_type.to_string(),
-                options: backend.opts.clone().unwrap_or_default(),
+                options: backend.opts(),
+                os: None,
                 backend,
                 source,
             },
             Some(("prefix", p)) => Self::Prefix {
                 prefix: p.to_string(),
-                options: backend.opts.clone().unwrap_or_default(),
+                options: backend.opts(),
+                os: None,
                 backend,
                 source,
             },
-            Some(("path", p)) => Self::Path(backend, PathBuf::from(p), source),
+            Some(("path", p)) => Self::Path {
+                path: PathBuf::from(p),
+                options: backend.opts(),
+                os: None,
+                backend,
+                source,
+            },
             Some((p, v)) if p.starts_with("sub-") => Self::Sub {
                 sub: p.split_once('-').unwrap().1.to_string(),
+                options: backend.opts(),
                 orig_version: v.to_string(),
+                os: None,
                 backend,
                 source,
             },
             None => {
                 if s == "system" {
-                    Self::System(backend, source)
+                    Self::System {
+                        options: backend.opts(),
+                        os: None,
+                        backend,
+                        source,
+                    }
                 } else {
                     Self::Version {
                         version: s,
-                        options: backend.opts.clone().unwrap_or_default(),
+                        options: backend.opts(),
+                        os: None,
                         backend,
                         source,
                     }
@@ -105,20 +138,20 @@ impl ToolRequest {
             Self::Version { source: s, .. }
             | Self::Prefix { source: s, .. }
             | Self::Ref { source: s, .. }
-            | Self::Path(_, _, s)
+            | Self::Path { source: s, .. }
             | Self::Sub { source: s, .. }
-            | Self::System(_, s) => *s = source,
+            | Self::System { source: s, .. } => *s = source,
         }
         self.clone()
     }
     pub fn ba(&self) -> &BackendArg {
         match self {
-            Self::Version { backend: f, .. }
-            | Self::Prefix { backend: f, .. }
-            | Self::Ref { backend: f, .. }
-            | Self::Path(f, ..)
-            | Self::Sub { backend: f, .. }
-            | Self::System(f, ..) => f,
+            Self::Version { backend, .. }
+            | Self::Prefix { backend, .. }
+            | Self::Ref { backend, .. }
+            | Self::Path { backend, .. }
+            | Self::Sub { backend, .. }
+            | Self::System { backend, .. } => backend,
         }
     }
     pub fn backend(&self) -> Result<ABackend> {
@@ -129,14 +162,42 @@ impl ToolRequest {
             Self::Version { source, .. }
             | Self::Prefix { source, .. }
             | Self::Ref { source, .. }
-            | Self::Path(.., source)
+            | Self::Path { source, .. }
             | Self::Sub { source, .. }
-            | Self::System(_, source) => source,
+            | Self::System { source, .. } => source,
         }
     }
-    pub fn dependencies(&self) -> eyre::Result<Vec<BackendArg>> {
-        let backend = self.ba().backend()?;
-        backend.get_all_dependencies(self)
+    pub fn os(&self) -> &Option<Vec<String>> {
+        match self {
+            Self::Version { os, .. }
+            | Self::Prefix { os, .. }
+            | Self::Ref { os, .. }
+            | Self::Path { os, .. }
+            | Self::Sub { os, .. }
+            | Self::System { os, .. } => os,
+        }
+    }
+    pub fn set_options(&mut self, options: ToolVersionOptions) -> &mut Self {
+        match self {
+            Self::Version { options: o, .. }
+            | Self::Prefix { options: o, .. }
+            | Self::Ref { options: o, .. }
+            | Self::Sub { options: o, .. }
+            | Self::Path { options: o, .. }
+            | Self::System { options: o, .. } => *o = options,
+        }
+        self
+    }
+    pub fn with_os(mut self, os: Option<Vec<String>>) -> Self {
+        match &mut self {
+            Self::Version { os: o, .. }
+            | Self::Prefix { os: o, .. }
+            | Self::Ref { os: o, .. }
+            | Self::Path { os: o, .. }
+            | Self::Sub { os: o, .. }
+            | Self::System { os: o, .. } => *o = os,
+        }
+        self
     }
     pub fn version(&self) -> String {
         match self {
@@ -145,11 +206,11 @@ impl ToolRequest {
             Self::Ref {
                 ref_: r, ref_type, ..
             } => format!("{ref_type}:{r}"),
-            Self::Path(_, p, ..) => format!("path:{}", p.display()),
+            Self::Path { path: p, .. } => format!("path:{}", p.display()),
             Self::Sub {
                 sub, orig_version, ..
             } => format!("sub-{}:{}", sub, orig_version),
-            Self::System(..) => "system".to_string(),
+            Self::System { .. } => "system".to_string(),
         }
     }
 
@@ -157,15 +218,22 @@ impl ToolRequest {
         match self {
             Self::Version { options: o, .. }
             | Self::Prefix { options: o, .. }
-            | Self::Ref { options: o, .. } => o.clone(),
-            _ => Default::default(),
+            | Self::Ref { options: o, .. }
+            | Self::Sub { options: o, .. }
+            | Self::Path { options: o, .. }
+            | Self::System { options: o, .. } => o.clone(),
         }
     }
 
     pub fn is_installed(&self) -> bool {
         if let Some(backend) = backend::get(self.ba()) {
-            let tv = ToolVersion::new(self.clone(), self.version());
-            backend.is_version_installed(&tv, false)
+            match self.resolve(&Default::default()) {
+                Ok(tv) => backend.is_version_installed(&tv, false),
+                Err(e) => {
+                    debug!("ToolRequest.is_installed: {e:#}");
+                    false
+                }
+            }
         } else {
             false
         }
@@ -204,21 +272,23 @@ impl ToolRequest {
                     .cloned(),
                 Err(_) => None,
             },
-            Self::Path(_, path, ..) => Some(path.clone()),
-            Self::System(..) => None,
+            Self::Path { path, .. } => Some(path.clone()),
+            Self::System { .. } => None,
         }
     }
 
-    pub fn lockfile_resolve(&self) -> Result<Option<String>> {
-        if let Some(path) = self.source().path() {
-            return lockfile::get_locked_version(path, &self.ba().short, &self.version());
+    pub fn lockfile_resolve(&self) -> Result<Option<LockfileTool>> {
+        match self.source() {
+            ToolSource::MiseToml(path) => {
+                lockfile::get_locked_version(Some(path), &self.ba().short, &self.version())
+            }
+            _ => lockfile::get_locked_version(None, &self.ba().short, &self.version()),
         }
-        Ok(None)
     }
 
     pub fn local_resolve(&self, v: &str) -> eyre::Result<Option<String>> {
-        if let Some(v) = self.lockfile_resolve()? {
-            return Ok(Some(v));
+        if let Some(lt) = self.lockfile_resolve()? {
+            return Ok(Some(lt.version));
         }
         if let Some(backend) = backend::get(self.ba()) {
             let matches = backend.list_installed_versions_matching(v)?;
@@ -234,6 +304,15 @@ impl ToolRequest {
 
     pub fn resolve(&self, opts: &ResolveOptions) -> Result<ToolVersion> {
         ToolVersion::resolve(self.clone(), opts)
+    }
+
+    pub fn is_os_supported(&self) -> bool {
+        if let Some(os) = self.os() {
+            if !os.contains(&crate::cli::version::OS) {
+                return false;
+            }
+        }
+        self.ba().is_os_supported()
     }
 }
 

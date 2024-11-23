@@ -22,12 +22,14 @@ use crate::config::tracking::Tracker;
 use crate::file::display_path;
 use crate::shorthands::{get_shorthands, Shorthands};
 use crate::task::Task;
-use crate::toolset::{install_state, ToolRequestSet, ToolRequestSetBuilder};
+use crate::toolset::{
+    install_state, ToolRequestSet, ToolRequestSetBuilder, ToolVersion, ToolsetBuilder,
+};
 use crate::ui::style;
-use crate::{backend, dirs, env, file, registry};
+use crate::{backend, dirs, env, file, lockfile, registry, runtime_symlinks, shims};
 
 pub mod config_file;
-mod env_directive;
+pub mod env_directive;
 pub mod settings;
 pub mod tracking;
 
@@ -43,10 +45,11 @@ pub struct Config {
     pub config_files: ConfigMap,
     pub project_root: Option<PathBuf>,
     pub all_aliases: AliasMap,
+    pub repo_urls: HashMap<String, String>,
+    pub vars: IndexMap<String, String>,
     aliases: AliasMap,
     env: OnceCell<EnvResults>,
     env_with_sources: OnceCell<EnvWithSources>,
-    repo_urls: HashMap<String, String>,
     shorthands: OnceLock<Shorthands>,
     tasks: OnceCell<BTreeMap<String, Task>>,
     tool_request_set: OnceCell<ToolRequestSet>,
@@ -87,7 +90,7 @@ impl Config {
             .cloned()
             .collect_vec();
         time!("load config_filenames");
-        let config_paths = load_config_paths(&config_filenames);
+        let config_paths = load_config_paths(&config_filenames, false);
         time!("load config_paths");
         trace!("config_paths: {config_paths:?}");
         let config_files = load_all_config_files(&config_paths, &legacy_files)?;
@@ -97,6 +100,7 @@ impl Config {
             aliases: load_aliases(&config_files)?,
             project_root: get_project_root(&config_files),
             repo_urls: load_plugins(&config_files)?,
+            vars: load_vars(&config_files)?,
             config_files,
             ..Default::default()
         };
@@ -125,10 +129,12 @@ impl Config {
             install_state::add_plugin(plugin, plugin_type)?;
         }
 
-        for (short, _) in config
+        for short in config
             .all_aliases
             .iter()
             .filter(|(_, a)| a.backend.is_some())
+            .map(|(s, _)| s)
+            .chain(config.repo_urls.keys())
         {
             // we need to remove aliased tools so they get re-added with updated "full" values
             backend::remove(short);
@@ -189,23 +195,20 @@ impl Config {
             .all_aliases
             .get(plugin_name)
             .and_then(|a| a.backend.clone())
+            .or_else(|| self.repo_urls.get(plugin_name).cloned())
             .unwrap_or(plugin_name.to_string());
         let plugin_name = plugin_name.strip_prefix("asdf:").unwrap_or(&plugin_name);
         let plugin_name = plugin_name.strip_prefix("vfox:").unwrap_or(plugin_name);
-        match self.repo_urls.get(plugin_name) {
-            Some(url) => Some(url.to_string()),
-            None => self
-                .get_shorthands()
-                .get(plugin_name)
-                .map(|full| registry::full_to_url(&full[0]))
-                .or_else(|| {
-                    if plugin_name.starts_with("https://") || plugin_name.split('/').count() == 2 {
-                        Some(registry::full_to_url(plugin_name))
-                    } else {
-                        None
-                    }
-                }),
-        }
+        self.get_shorthands()
+            .get(plugin_name)
+            .map(|full| registry::full_to_url(&full[0]))
+            .or_else(|| {
+                if plugin_name.starts_with("https://") || plugin_name.split('/').count() == 2 {
+                    Some(registry::full_to_url(plugin_name))
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn tasks(&self) -> Result<&BTreeMap<String, Task>> {
@@ -489,14 +492,6 @@ impl Config {
         Ok(config_files)
     }
 
-    pub fn rebuild_shims_and_runtime_symlinks(&self) -> Result<()> {
-        install_state::reset();
-        let ts = crate::toolset::ToolsetBuilder::new().build(self)?;
-        crate::shims::reshim(&ts, false)?;
-        crate::runtime_symlinks::rebuild(self)?;
-        Ok(())
-    }
-
     pub fn global_config(&self) -> Result<MiseToml> {
         let settings_path = env::MISE_GLOBAL_CONFIG_FILE.to_path_buf();
         match settings_path.exists() {
@@ -569,10 +564,12 @@ impl Config {
 }
 
 fn get_project_root(config_files: &ConfigMap) -> Option<PathBuf> {
-    config_files
+    let project_root = config_files
         .values()
         .find_map(|cf| cf.project_root())
-        .map(|pr| pr.to_path_buf())
+        .map(|pr| pr.to_path_buf());
+    trace!("project_root: {project_root:?}");
+    project_root
 }
 
 fn load_legacy_files() -> BTreeMap<String, Vec<String>> {
@@ -660,8 +657,15 @@ pub static DEFAULT_CONFIG_FILENAMES: Lazy<Vec<String>> = Lazy::new(|| {
     }
     filenames
 });
+static TOML_CONFIG_FILENAMES: Lazy<Vec<String>> = Lazy::new(|| {
+    DEFAULT_CONFIG_FILENAMES
+        .iter()
+        .filter(|s| s.ends_with(".toml"))
+        .map(|s| s.to_string())
+        .collect()
+});
 
-pub fn load_config_paths(config_filenames: &[String]) -> Vec<PathBuf> {
+pub fn load_config_paths(config_filenames: &[String], include_ignored: bool) -> Vec<PathBuf> {
     let mut config_files = Vec::new();
 
     // The current directory is not always available, e.g.
@@ -676,6 +680,7 @@ pub fn load_config_paths(config_filenames: &[String]) -> Vec<PathBuf> {
     config_files
         .into_iter()
         .unique_by(|p| file::desymlink_path(p))
+        .filter(|p| include_ignored || !config_file::is_ignored(p))
         .collect()
 }
 
@@ -731,6 +736,45 @@ pub fn system_config_files() -> Vec<PathBuf> {
     config_files
 }
 
+/// the top-most global config file or the path to where it should be written to
+pub fn global_config_path() -> PathBuf {
+    global_config_files()
+        .into_iter()
+        .next_back()
+        .unwrap_or_else(|| env::MISE_GLOBAL_CONFIG_FILE.clone())
+}
+
+/// the top-most mise.toml (local or global)
+pub fn top_toml_config() -> Option<PathBuf> {
+    load_config_paths(&TOML_CONFIG_FILENAMES, false)
+        .iter()
+        .rev()
+        .find(|p| p.to_string_lossy().ends_with(".toml"))
+        .map(|p| p.to_path_buf())
+}
+
+/// list of all non-global mise.tomls
+pub fn local_toml_config_paths() -> Vec<PathBuf> {
+    load_config_paths(&DEFAULT_CONFIG_FILENAMES, false)
+        .into_iter()
+        .filter(|p| !is_global_config(p))
+        .collect()
+}
+
+/// either the top local mise.toml or the path to where it should be written to
+pub fn local_toml_config_path() -> PathBuf {
+    static CWD: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("."));
+    local_toml_config_paths()
+        .into_iter()
+        .next_back()
+        .unwrap_or_else(|| {
+            dirs::CWD
+                .as_ref()
+                .unwrap_or(&CWD)
+                .join(&*env::MISE_DEFAULT_CONFIG_FILENAME)
+        })
+}
+
 fn load_all_config_files(
     config_filenames: &[PathBuf],
     legacy_filenames: &BTreeMap<String, Vec<String>>,
@@ -752,8 +796,6 @@ fn load_all_config_files(
             }
             Ok((f.clone(), cf))
         })
-        .collect::<Vec<Result<_>>>()
-        .into_iter()
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .collect())
@@ -765,6 +807,7 @@ fn parse_config_file(
 ) -> Result<Box<dyn ConfigFile>> {
     match legacy_filenames.get(&f.file_name().unwrap().to_string_lossy().to_string()) {
         Some(plugin) => {
+            trace!("legacy version file: {}", display_path(f));
             let tools = backend::list()
                 .into_iter()
                 .filter(|f| plugin.contains(&f.to_string()))
@@ -789,6 +832,7 @@ fn load_aliases(config_files: &ConfigMap) -> Result<AliasMap> {
             }
         }
     }
+    trace!("load_aliases: {}", aliases.len());
 
     Ok(aliases)
 }
@@ -800,7 +844,19 @@ fn load_plugins(config_files: &ConfigMap) -> Result<HashMap<String, String>> {
             plugins.insert(plugin.clone(), url.clone());
         }
     }
+    trace!("load_plugins: {}", plugins.len());
     Ok(plugins)
+}
+
+fn load_vars(config_files: &ConfigMap) -> Result<IndexMap<String, String>> {
+    let mut vars = IndexMap::new();
+    for config_file in config_files.values() {
+        for (k, v) in config_file.vars()?.clone() {
+            vars.insert(k, v);
+        }
+    }
+    trace!("load_vars: {}", vars.len());
+    Ok(vars)
 }
 
 impl Debug for Config {
@@ -838,12 +894,26 @@ impl Debug for Config {
 
 fn default_task_includes() -> Vec<PathBuf> {
     vec![
-        "mise-tasks".into(),
-        ".mise-tasks".into(),
-        ".mise/tasks".into(),
-        ".config/mise/tasks".into(),
-        "mise/tasks".into(),
+        PathBuf::from("mise-tasks"),
+        PathBuf::from(".mise-tasks"),
+        PathBuf::from(".mise").join("tasks"),
+        PathBuf::from(".config").join("mise").join("tasks"),
+        PathBuf::from("mise").join("tasks"),
     ]
+}
+
+pub fn rebuild_shims_and_runtime_symlinks(new_versions: &[ToolVersion]) -> Result<()> {
+    let config = Config::load()?;
+    let ts = ToolsetBuilder::new().build(&config)?;
+    install_state::reset();
+    trace!("rebuilding shims");
+    shims::reshim(&ts, false).wrap_err("failed to rebuild shims")?;
+    trace!("rebuilding runtime symlinks");
+    runtime_symlinks::rebuild(&config).wrap_err("failed to rebuild runtime symlinks")?;
+    trace!("updating lockfiles");
+    lockfile::update_lockfiles(&config, &ts, new_versions)
+        .wrap_err("failed to update lockfiles")?;
+    Ok(())
 }
 
 #[cfg(test)]

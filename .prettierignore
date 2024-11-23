@@ -4,8 +4,8 @@ registry/
 docs/cli
 docs/environments.md
 docs/registry.md
+docs/.vitepress/cache
 docs/.vitepress/dist
 docs/public/site.webmanifest
-schema/mise.json.hbs
 tasks.md
 tasks/fig/src/mise.ts

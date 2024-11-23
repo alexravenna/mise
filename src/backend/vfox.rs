@@ -15,7 +15,8 @@ use crate::dirs;
 use crate::install_context::InstallContext;
 use crate::plugins::vfox_plugin::VfoxPlugin;
 use crate::plugins::{Plugin, PluginType};
-use crate::toolset::{ToolRequest, ToolVersion, Toolset};
+use crate::tokio::RUNTIME;
+use crate::toolset::{ToolVersion, Toolset};
 use crate::ui::multi_progress_report::MultiProgressReport;
 
 #[derive(Debug)]
@@ -32,12 +33,12 @@ impl Backend for VfoxBackend {
         BackendType::Vfox
     }
 
-    fn get_plugin_type(&self) -> Option<PluginType> {
-        Some(PluginType::Vfox)
-    }
-
     fn ba(&self) -> &BackendArg {
         &self.ba
+    }
+
+    fn get_plugin_type(&self) -> Option<PluginType> {
+        Some(PluginType::Vfox)
     }
 
     fn _list_remote_versions(&self) -> eyre::Result<Vec<String>> {
@@ -45,10 +46,7 @@ impl Backend for VfoxBackend {
             .get_or_try_init(|| {
                 let (vfox, _log_rx) = self.plugin.vfox();
                 self.ensure_plugin_installed()?;
-                let versions = self
-                    .plugin
-                    .runtime()?
-                    .block_on(vfox.list_available_versions(&self.pathname))?;
+                let versions = RUNTIME.block_on(vfox.list_available_versions(&self.pathname))?;
                 Ok(versions
                     .into_iter()
                     .rev()
@@ -58,7 +56,11 @@ impl Backend for VfoxBackend {
             .cloned()
     }
 
-    fn install_version_impl(&self, ctx: &InstallContext) -> eyre::Result<()> {
+    fn install_version_impl(
+        &self,
+        _ctx: &InstallContext,
+        tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
         self.ensure_plugin_installed()?;
         let (vfox, log_rx) = self.plugin.vfox();
         thread::spawn(|| {
@@ -67,12 +69,8 @@ impl Backend for VfoxBackend {
                 info!("{}", line);
             }
         });
-        self.plugin.runtime()?.block_on(vfox.install(
-            &self.pathname,
-            &ctx.tv.version,
-            ctx.tv.install_path(),
-        ))?;
-        Ok(())
+        RUNTIME.block_on(vfox.install(&self.pathname, &tv.version, tv.install_path()))?;
+        Ok(tv)
     }
 
     fn list_bin_paths(&self, tv: &ToolVersion) -> eyre::Result<Vec<PathBuf>> {
@@ -97,22 +95,13 @@ impl Backend for VfoxBackend {
             .filter(|(k, _)| k.to_uppercase() != "PATH")
             .collect())
     }
-
-    fn get_dependencies(&self, tvr: &ToolRequest) -> eyre::Result<Vec<BackendArg>> {
-        let out = match tvr.ba().tool_name.as_str() {
-            "poetry" | "pipenv" | "pipx" => vec!["python"],
-            "elixir" => vec!["erlang"],
-            _ => vec![],
-        };
-        Ok(out.into_iter().map(|s| s.into()).collect())
-    }
 }
 
 impl VfoxBackend {
     pub fn from_arg(ba: BackendArg) -> Self {
         let pathname = ba.short.to_kebab_case();
         let plugin_path = dirs::PLUGINS.join(&pathname);
-        let mut plugin = VfoxPlugin::new(pathname.clone());
+        let mut plugin = VfoxPlugin::new(pathname.clone(), plugin_path.clone());
         plugin.full = Some(ba.full());
         Self {
             remote_version_cache: CacheManagerBuilder::new(
@@ -149,9 +138,7 @@ impl VfoxBackend {
             .get_or_try_init(|| {
                 self.ensure_plugin_installed()?;
                 let (vfox, _log_rx) = self.plugin.vfox();
-                Ok(self
-                    .plugin
-                    .runtime()?
+                Ok(RUNTIME
                     .block_on(vfox.env_keys(&self.pathname, &tv.version))?
                     .into_iter()
                     .fold(BTreeMap::new(), |mut acc, env_key| {

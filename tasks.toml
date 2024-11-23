@@ -7,9 +7,24 @@ lint = { depends = ["lint:*"] }
 
 [build]
 alias = "b"
-run = "cargo build --color always --all-features"
+run = "cargo build --all-features"
+run_windows = "cargo build --features clap_mangen"
 #sources = ["Cargo.*", "src/**/*.rs"]
 #outputs = ["target/debug/mise"]
+
+[docs]
+depends = ["docs:setup"]
+dir = "docs"
+run = "bun run docs:dev"
+
+["docs:setup"]
+dir = "docs"
+run = ["cd .. && bun i", "bun i"]
+
+["docs:build"]
+depends = ["docs:setup"]
+dir = "docs"
+run = "bun run docs:build"
 
 ["render:usage"]
 depends = ["build"]
@@ -22,7 +37,8 @@ run = [
 ]
 
 ["render:completions"]
-depends = ["build", "render:usage"]
+depends = ["build"]
+wait_for = ["render:usage"]
 env = { NO_COLOR = "1" }
 run = '''
 #!/usr/bin/env bash
@@ -45,9 +61,9 @@ env = { NO_COLOR = "1" }
 run = "mise render-mangen"
 
 ["render:fig"]
-depends = ["build", "render:usage", "render:completions"]
+wait_for = ["render:completions"]
 run = [
-    'usage generate fig --file mise.usage.kdl --out-file tasks/fig/src/mise.ts',
+    "usage generate fig --file mise.usage.kdl --out-file tasks/fig/src/mise.ts",
     "tsx tasks/fig/addCustomGenerators.ts tasks/fig/src/mise.ts tasks/fig/src/mise.ts"
 ]
 
@@ -64,7 +80,7 @@ depends = ["render:*"]
 
 [snapshots]
 description = "update test snapshots"
-run = "cargo insta test --accept --unreferenced delete"
+run = "cargo insta test --all-features --accept --unreferenced delete"
 
 [test]
 description = "run all tests"

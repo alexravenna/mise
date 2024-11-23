@@ -18,7 +18,7 @@ alias = 'b' # `mise run b`
 
 [tasks.test]
 description = 'Run automated tests'
-run = [ # multiple commands are run in series
+run = [# multiple commands are run in series
     'cargo test',
     './scripts/test-e2e.sh',
 ]
@@ -26,7 +26,7 @@ dir = "{{cwd}}" # run in user's cwd, default is the project's base directory
 
 [tasks.lint]
 description = 'Lint with clippy'
-env = {RUST_BACKTRACE = '1'} # env vars for the script
+env = { RUST_BACKTRACE = '1' } # env vars for the script
 # specify a shell command to run the script with (default is 'sh -c')
 shell = 'bash -c'
 # you can specify a multiline script instead of individual commands
@@ -53,7 +53,8 @@ By default, arguments are passed to the last script in the `run` array. So if a 
 run = ['cargo test', './scripts/test-e2e.sh']
 ```
 
-Then running `mise run test foo bar` will pass `foo bar` to `./scripts/test-e2e.sh` but not to `cargo test`.
+Then running `mise run test foo bar` will pass `foo bar` to `./scripts/test-e2e.sh` but not to
+`cargo test`.
 
 You can also define arguments using templates:
 
@@ -65,8 +66,10 @@ run = [
 ]
 ```
 
-Then running `mise run test foo bar` will pass `foo bar` to `cargo test`. `mise run test --e2e-args baz` will pass `baz` to `./scripts/test-e2e.sh`.
-If any arguments are defined with templates then mise will not pass the arguments to the last script in the `run` array.
+Then running `mise run test foo bar` will pass `foo bar` to `cargo test`.
+`mise run test --e2e-args baz` will pass `baz` to `./scripts/test-e2e.sh`.
+If any arguments are defined with templates then mise will not pass the arguments to the last script
+in the `run` array.
 
 :::tip
 Using templates to define arguments will make them work with completion and help messages.
@@ -74,7 +77,8 @@ Using templates to define arguments will make them work with completion and help
 
 ### Positional Arguments
 
-These are defined in scripts with <span v-pre>`{{arg()}}`</span>. They are used for positional arguments where the order matters.
+These are defined in scripts with <span v-pre>`{{arg()}}`</span>. They are used for positional
+arguments where the order matters.
 
 Example:
 
@@ -85,14 +89,16 @@ run = 'cargo test {{arg(name="file")}}'
 # runs: cargo test my-test-file
 ```
 
-- `i`: The index of the argument. This can be used to specify the order of arguments. Defaults to the order they're defined in the scripts.
+- `i`: The index of the argument. This can be used to specify the order of arguments. Defaults to
+  the order they're defined in the scripts.
 - `name`: The name of the argument. This is used for help/error messages.
 - `var`: If `true`, multiple arguments can be passed.
 - `default`: The default value if the argument is not provided.
 
 ### Options
 
-These are defined in scripts with <span v-pre>`{{option()}}`</span>. They are used for named arguments where the order doesn't matter.
+These are defined in scripts with <span v-pre>`{{option()}}`</span>. They are used for named
+arguments where the order doesn't matter.
 
 Example:
 
@@ -109,7 +115,8 @@ run = 'cargo test {{option(name="file")}}'
 
 ### Flags
 
-Flags are like options except they don't take values. They are defined in scripts with <span v-pre>`{{flag()}}`</span>.
+Flags are like options except they don't take values. They are defined in scripts with <span v-pre>
+`{{flag()}}`</span>.
 
 Example:
 
@@ -123,3 +130,13 @@ run = 'echo {{flag(name=("myflag")}}'
 - `name`: The name of the flag. This is used for help/error messages.
 
 The value will be `true` if the flag is passed, and `false` otherwise.
+
+## Windows
+
+You can specify an alternate command to run on Windows by using the `run_windows` key:
+
+```toml
+[tasks.test]
+run = 'cargo test'
+run_windows = 'cargo test --features windows'
+```

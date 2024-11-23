@@ -8,7 +8,7 @@ use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, SETTINGS};
 use crate::install_context::InstallContext;
-use crate::toolset::ToolRequest;
+use crate::toolset::ToolVersion;
 
 #[derive(Debug)]
 pub struct NPMBackend {
@@ -28,14 +28,14 @@ impl Backend for NPMBackend {
         &self.ba
     }
 
-    fn get_dependencies(&self, _tvr: &ToolRequest) -> eyre::Result<Vec<BackendArg>> {
-        Ok(vec!["node".into(), "bun".into()])
+    fn get_dependencies(&self) -> eyre::Result<Vec<&str>> {
+        Ok(vec!["node", "bun"])
     }
 
     fn _list_remote_versions(&self) -> eyre::Result<Vec<String>> {
         self.remote_version_cache
             .get_or_try_init(|| {
-                let raw = cmd!(NPM_PROGRAM, "view", self.name(), "versions", "--json")
+                let raw = cmd!(NPM_PROGRAM, "view", self.tool_name(), "versions", "--json")
                     .full_env(self.dependency_env()?)
                     .read()?;
                 let versions: Vec<String> = serde_json::from_str(&raw)?;
@@ -47,7 +47,7 @@ impl Backend for NPMBackend {
     fn latest_stable_version(&self) -> eyre::Result<Option<String>> {
         self.latest_version_cache
             .get_or_try_init(|| {
-                let raw = cmd!(NPM_PROGRAM, "view", self.name(), "dist-tags", "--json")
+                let raw = cmd!(NPM_PROGRAM, "view", self.tool_name(), "dist-tags", "--json")
                     .full_env(self.dependency_env()?)
                     .read()?;
                 let dist_tags: Value = serde_json::from_str(&raw)?;
@@ -60,21 +60,25 @@ impl Backend for NPMBackend {
             .cloned()
     }
 
-    fn install_version_impl(&self, ctx: &InstallContext) -> eyre::Result<()> {
+    fn install_version_impl(
+        &self,
+        ctx: &InstallContext,
+        tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
         let config = Config::try_get()?;
 
         if SETTINGS.npm.bun {
             CmdLineRunner::new("bun")
                 .arg("install")
-                .arg(format!("{}@{}", self.name(), ctx.tv.version))
+                .arg(format!("{}@{}", self.tool_name(), tv.version))
                 .arg("--cwd")
-                .arg(ctx.tv.install_path())
+                .arg(tv.install_path())
                 .arg("--global")
                 .arg("--trust")
                 .with_pr(ctx.pr.as_ref())
                 .envs(ctx.ts.env_with_path(&config)?)
-                .env("BUN_INSTALL_GLOBAL_DIR", ctx.tv.install_path())
-                .env("BUN_INSTALL_BIN", ctx.tv.install_path().join("bin"))
+                .env("BUN_INSTALL_GLOBAL_DIR", tv.install_path())
+                .env("BUN_INSTALL_BIN", tv.install_path().join("bin"))
                 .prepend_path(ctx.ts.list_paths())?
                 .prepend_path(self.dependency_toolset()?.list_paths())?
                 .execute()?;
@@ -82,16 +86,16 @@ impl Backend for NPMBackend {
             CmdLineRunner::new(NPM_PROGRAM)
                 .arg("install")
                 .arg("-g")
-                .arg(format!("{}@{}", self.name(), ctx.tv.version))
+                .arg(format!("{}@{}", self.tool_name(), tv.version))
                 .arg("--prefix")
-                .arg(ctx.tv.install_path())
+                .arg(tv.install_path())
                 .with_pr(ctx.pr.as_ref())
                 .envs(ctx.ts.env_with_path(&config)?)
                 .prepend_path(ctx.ts.list_paths())?
                 .prepend_path(self.dependency_toolset()?.list_paths())?
                 .execute()?;
         }
-        Ok(())
+        Ok(tv)
     }
 
     #[cfg(windows)]

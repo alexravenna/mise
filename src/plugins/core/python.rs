@@ -45,15 +45,15 @@ impl PythonPlugin {
         self.python_build_path()
             .join("plugins/python-build/bin/python-build")
     }
-    fn install_or_update_python_build(&self) -> eyre::Result<()> {
+    fn install_or_update_python_build(&self, ctx: Option<&InstallContext>) -> eyre::Result<()> {
         ensure_not_windows()?;
         if self.python_build_bin().exists() {
             self.update_python_build()
         } else {
-            self.install_python_build()
+            self.install_python_build(ctx)
         }
     }
-    fn install_python_build(&self) -> eyre::Result<()> {
+    fn install_python_build(&self, ctx: Option<&InstallContext>) -> eyre::Result<()> {
         if self.python_build_bin().exists() {
             return Ok(());
         }
@@ -62,7 +62,8 @@ impl PythonPlugin {
         file::remove_all(&python_build_path)?;
         file::create_dir_all(self.python_build_path().parent().unwrap())?;
         let git = Git::new(self.python_build_path());
-        git.clone(&SETTINGS.python.pyenv_repo)?;
+        let pr = ctx.map(|ctx| ctx.pr.as_ref());
+        git.clone(&SETTINGS.python.pyenv_repo, pr)?;
         Ok(())
     }
     fn update_python_build(&self) -> eyre::Result<()> {
@@ -131,12 +132,12 @@ impl PythonPlugin {
         })
     }
 
-    fn install_precompiled(&self, ctx: &InstallContext) -> eyre::Result<()> {
+    fn install_precompiled(&self, ctx: &InstallContext, tv: &ToolVersion) -> eyre::Result<()> {
         let precompiled_versions = self.fetch_precompiled_remote_versions()?;
         let precompile_info = precompiled_versions
             .iter()
             .rev()
-            .find(|(v, _, _)| &ctx.tv.version == v);
+            .find(|(v, _, _)| &tv.version == v);
         let (tag, filename) = match precompile_info {
             Some((_, tag, filename)) => (tag, filename),
             None => {
@@ -145,20 +146,20 @@ impl PythonPlugin {
                         hint!(
                             "python_compile",
                             "To compile python from source, run",
-                            "mise settings set python.compile 1"
+                            "mise settings python.compile=1"
                         );
                     }
                     let arch = python_arch();
                     let os = python_os();
                     bail!(
                         "no precompiled python found for {} on {arch}-{os}",
-                        ctx.tv.version
+                        tv.version
                     );
                 }
-                debug!("no precompiled python found for {}", ctx.tv.version);
+                debug!("no precompiled python found for {}", tv.version);
                 let mut available = precompiled_versions.iter().map(|(v, _, _)| v);
                 trace!("available precompiled versions: {}", available.join(", "));
-                return self.install_compiled(ctx);
+                return self.install_compiled(ctx, tv);
             }
         };
 
@@ -167,7 +168,7 @@ impl PythonPlugin {
                 "python_precompiled",
                 "installing precompiled python from indygreg/python-build-standalone\n\
                 if you experience issues with this python (e.g.: running poetry), switch to python-build by running",
-                "mise settings set python.compile 1"
+                "mise settings python.compile=1"
             );
         }
 
@@ -175,14 +176,13 @@ impl PythonPlugin {
             "https://github.com/indygreg/python-build-standalone/releases/download/{tag}/{filename}"
         );
         let filename = url.split('/').last().unwrap();
-        let install = ctx.tv.install_path();
-        let download = ctx.tv.download_path();
+        let install = tv.install_path();
+        let download = tv.download_path();
         let tarball_path = download.join(filename);
 
-        ctx.pr.set_message(format!("downloading {filename}"));
+        ctx.pr.set_message(format!("download {filename}"));
         HTTP.download_file(&url, &tarball_path, Some(ctx.pr.as_ref()))?;
 
-        ctx.pr.set_message(format!("installing {filename}"));
         file::remove_all(&install)?;
         file::untar(
             &tarball_path,
@@ -198,17 +198,17 @@ impl PythonPlugin {
         Ok(())
     }
 
-    fn install_compiled(&self, ctx: &InstallContext) -> eyre::Result<()> {
+    fn install_compiled(&self, ctx: &InstallContext, tv: &ToolVersion) -> eyre::Result<()> {
         let config = Config::get();
-        self.install_or_update_python_build()?;
-        if matches!(&ctx.tv.request, ToolRequest::Ref { .. }) {
+        self.install_or_update_python_build(Some(ctx))?;
+        if matches!(&tv.request, ToolRequest::Ref { .. }) {
             return Err(eyre!("Ref versions not supported for python"));
         }
-        ctx.pr.set_message("Running python-build".into());
+        ctx.pr.set_message("python-build".into());
         let mut cmd = CmdLineRunner::new(self.python_build_bin())
             .with_pr(ctx.pr.as_ref())
-            .arg(ctx.tv.version.as_str())
-            .arg(ctx.tv.install_path())
+            .arg(tv.version.as_str())
+            .arg(tv.install_path())
             .env("PIP_REQUIRE_VIRTUALENV", "false")
             .envs(config.env()?);
         if SETTINGS.verbose {
@@ -221,7 +221,7 @@ impl PythonPlugin {
             cmd = cmd.arg("--patch").stdin_string(patch)
         }
         if let Some(patches_dir) = &SETTINGS.python.patches_directory {
-            let patch_file = patches_dir.join(format!("{}.patch", &ctx.tv.version));
+            let patch_file = patches_dir.join(format!("{}.patch", &tv.version));
             if patch_file.exists() {
                 ctx.pr
                     .set_message(format!("with patch file: {}", patch_file.display()));
@@ -245,7 +245,7 @@ impl PythonPlugin {
         if !packages_file.exists() {
             return Ok(());
         }
-        pr.set_message("installing default packages".into());
+        pr.set_message("install default packages".into());
         CmdLineRunner::new(tv.install_path().join("bin/python"))
             .with_pr(pr)
             .arg("-m")
@@ -268,7 +268,7 @@ impl PythonPlugin {
         if let Some(virtualenv) = tv.request.options().get("virtualenv") {
             if !SETTINGS.experimental {
                 warn!(
-                    "please enable experimental mode with `mise settings set experimental true` \
+                    "please enable experimental mode with `mise settings experimental=true` \
                     to use python virtualenv activation"
                 );
             }
@@ -351,7 +351,7 @@ impl Backend for PythonPlugin {
                 .map(|(v, _, _)| v.clone())
                 .collect())
         } else {
-            self.install_or_update_python_build()?;
+            self.install_or_update_python_build(None)?;
             let python_build_bin = self.python_build_bin();
             plugins::core::run_fetch_task_with_timeout(move || {
                 let output = cmd!(python_build_bin, "--definitions").read()?;
@@ -367,47 +367,38 @@ impl Backend for PythonPlugin {
         }
     }
 
-    fn get_remote_version_cache(&self) -> Arc<VersionCacheManager> {
-        static CACHE: OnceLock<Arc<VersionCacheManager>> = OnceLock::new();
-        CACHE
-            .get_or_init(|| {
-                CacheManagerBuilder::new(self.ba().cache_path.join("remote_versions.msgpack.z"))
-                    .with_fresh_duration(SETTINGS.fetch_remote_versions_cache())
-                    .with_cache_key((SETTINGS.python.compile == Some(false)).to_string())
-                    .build()
-                    .into()
-            })
-            .clone()
+    fn legacy_filenames(&self) -> eyre::Result<Vec<String>> {
+        Ok(vec![".python-version".to_string()])
+    }
+
+    fn install_version_impl(
+        &self,
+        ctx: &InstallContext,
+        tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
+        let config = Config::get();
+        if cfg!(windows) || SETTINGS.python.compile != Some(true) {
+            self.install_precompiled(ctx, &tv)?;
+        } else {
+            self.install_compiled(ctx, &tv)?;
+        }
+        self.test_python(&config, &tv, ctx.pr.as_ref())?;
+        if let Err(e) = self.get_virtualenv(&config, &tv, Some(ctx.pr.as_ref())) {
+            warn!("failed to get virtualenv: {e:#}");
+        }
+        if let Some(default_file) = &SETTINGS.python.default_packages_file {
+            if let Err(err) =
+                self.install_default_packages(&config, default_file, &tv, ctx.pr.as_ref())
+            {
+                warn!("failed to install default python packages: {err:#}");
+            }
+        }
+        Ok(tv)
     }
 
     #[cfg(windows)]
     fn list_bin_paths(&self, tv: &ToolVersion) -> eyre::Result<Vec<PathBuf>> {
         Ok(vec![tv.install_path()])
-    }
-
-    fn legacy_filenames(&self) -> eyre::Result<Vec<String>> {
-        Ok(vec![".python-version".to_string()])
-    }
-
-    fn install_version_impl(&self, ctx: &InstallContext) -> eyre::Result<()> {
-        let config = Config::get();
-        if cfg!(windows) || SETTINGS.python.compile != Some(true) {
-            self.install_precompiled(ctx)?;
-        } else {
-            self.install_compiled(ctx)?;
-        }
-        self.test_python(&config, &ctx.tv, ctx.pr.as_ref())?;
-        if let Err(e) = self.get_virtualenv(&config, &ctx.tv, Some(ctx.pr.as_ref())) {
-            warn!("failed to get virtualenv: {e:#}");
-        }
-        if let Some(default_file) = &SETTINGS.python.default_packages_file {
-            if let Err(err) =
-                self.install_default_packages(&config, default_file, &ctx.tv, ctx.pr.as_ref())
-            {
-                warn!("failed to install default python packages: {err:#}");
-            }
-        }
-        Ok(())
     }
 
     fn exec_env(
@@ -427,6 +418,19 @@ impl Backend for PythonPlugin {
             Ok(None) => {}
         };
         Ok(hm)
+    }
+
+    fn get_remote_version_cache(&self) -> Arc<VersionCacheManager> {
+        static CACHE: OnceLock<Arc<VersionCacheManager>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                CacheManagerBuilder::new(self.ba().cache_path.join("remote_versions.msgpack.z"))
+                    .with_fresh_duration(SETTINGS.fetch_remote_versions_cache())
+                    .with_cache_key((SETTINGS.python.compile == Some(false)).to_string())
+                    .build()
+                    .into()
+            })
+            .clone()
     }
 }
 

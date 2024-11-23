@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
 use std::fs;
 use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 #[cfg(unix)]
@@ -30,6 +30,17 @@ pub fn open<P: AsRef<Path>>(path: P) -> Result<File> {
     let path = path.as_ref();
     trace!("open {}", display_path(path));
     File::open(path).wrap_err_with(|| format!("failed open: {}", display_path(path)))
+}
+
+pub fn append<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<()> {
+    let path = path.as_ref();
+    trace!("append {}", display_path(path));
+    fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(contents.as_ref()))
+        .wrap_err_with(|| format!("failed append: {}", display_path(path)))
 }
 
 pub fn remove_all<P: AsRef<Path>>(path: P) -> Result<()> {
@@ -239,8 +250,8 @@ pub fn find_up<FN: AsRef<str>>(from: &Path, filenames: &[FN]) -> Option<PathBuf>
     }
 }
 
-pub fn dir_subdirs(dir: &Path) -> Result<Vec<String>> {
-    let mut output = vec![];
+pub fn dir_subdirs(dir: &Path) -> Result<BTreeSet<String>> {
+    let mut output = Default::default();
 
     if !dir.exists() {
         return Ok(output);
@@ -250,15 +261,15 @@ pub fn dir_subdirs(dir: &Path) -> Result<Vec<String>> {
         let entry = entry?;
         let ft = entry.file_type()?;
         if ft.is_dir() || (ft.is_symlink() && entry.path().read_link()?.is_dir()) {
-            output.push(entry.file_name().into_string().unwrap());
+            output.insert(entry.file_name().into_string().unwrap());
         }
     }
 
     Ok(output)
 }
 
-pub fn ls(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut output = vec![];
+pub fn ls(dir: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut output = Default::default();
 
     if !dir.is_dir() {
         return Ok(output);
@@ -266,15 +277,15 @@ pub fn ls(dir: &Path) -> Result<Vec<PathBuf>> {
 
     for entry in dir.read_dir()? {
         let entry = entry?;
-        output.push(entry.path());
+        output.insert(entry.path());
     }
 
     Ok(output)
 }
 
-pub fn recursive_ls(dir: &Path) -> Result<Vec<PathBuf>> {
+pub fn recursive_ls(dir: &Path) -> Result<BTreeSet<PathBuf>> {
     if !dir.is_dir() {
-        return Ok(vec![]);
+        return Ok(Default::default());
     }
 
     Ok(WalkDir::new(dir)
@@ -367,12 +378,12 @@ pub fn is_executable(path: &Path) -> bool {
     path.extension().map_or(
         SETTINGS
             .windows_executable_extensions
-            .contains(&String::from("")),
+            .contains(&String::new()),
         |ext| {
             if let Some(str_val) = ext.to_str() {
                 return SETTINGS
                     .windows_executable_extensions
-                    .contains(&str_val.to_string());
+                    .contains(&str_val.to_lowercase().to_string());
             }
             false
         },
@@ -554,12 +565,12 @@ pub fn untar(archive: &Path, dest: &Path, opts: &TarOptions) -> Result<()> {
     debug!("tar -xf {} -C {}", archive.display(), dest.display());
     if let Some(pr) = &opts.pr {
         pr.set_message(format!(
-            "extracting {}",
+            "extract {}",
             archive.file_name().unwrap().to_string_lossy()
         ));
     }
     let f = File::open(archive)?;
-    let mut tar: Box<dyn std::io::Read> = match opts.format {
+    let tar: Box<dyn std::io::Read> = match opts.format {
         TarFormat::TarGz => Box::new(GzDecoder::new(f)),
         TarFormat::TarXz => Box::new(xz2::read::XzDecoder::new(f)),
         TarFormat::TarBz2 => Box::new(bzip2::read::BzDecoder::new(f)),
@@ -569,39 +580,41 @@ pub fn untar(archive: &Path, dest: &Path, opts: &TarOptions) -> Result<()> {
         let dest = display_path(dest);
         format!("failed to extract tar: {archive} to {dest}")
     };
-    let mut cur = Cursor::new(vec![]);
-    let mut total = 0;
-    loop {
-        let mut buf = Cursor::new(vec![0; 1024 * 1024]);
-        let n = tar.read(buf.get_mut()).wrap_err_with(err)?;
-        cur.get_mut().extend_from_slice(&buf.get_ref()[..n]);
-        if n == 0 {
-            break;
-        }
-        if let Some(pr) = &opts.pr {
-            total += n as u64;
-            pr.set_length(total);
-        }
-    }
-    for entry in Archive::new(cur).entries().wrap_err_with(err)? {
+    // TODO: put this back in when we can read+write in parallel
+    // let mut cur = Cursor::new(vec![]);
+    // let mut total = 0;
+    // loop {
+    //     let mut buf = Cursor::new(vec![0; 1024 * 1024]);
+    //     let n = tar.read(buf.get_mut()).wrap_err_with(err)?;
+    //     cur.get_mut().extend_from_slice(&buf.get_ref()[..n]);
+    //     if n == 0 {
+    //         break;
+    //     }
+    //     if let Some(pr) = &opts.pr {
+    //         total += n as u64;
+    //         pr.set_length(total);
+    //     }
+    // }
+    for entry in Archive::new(tar).entries().wrap_err_with(err)? {
         let mut entry = entry.wrap_err_with(err)?;
         let path: PathBuf = entry
             .path()
             .wrap_err_with(err)?
             .components()
             .skip(opts.strip_components)
+            .filter(|c| c.as_os_str() != ".")
             .collect();
         let path = dest.join(path);
         create_dir_all(path.parent().unwrap()).wrap_err_with(err)?;
         trace!("extracting {}", display_path(&path));
         entry.unpack(&path).wrap_err_with(err)?;
         if let Some(pr) = &opts.pr {
-            pr.set_position(entry.raw_file_position());
+            pr.set_length(entry.raw_file_position());
         }
     }
-    if let Some(pr) = &opts.pr {
-        pr.set_position(total);
-    }
+    // if let Some(pr) = &opts.pr {
+    //     pr.set_position(total);
+    // }
     Ok(())
 }
 
@@ -612,6 +625,28 @@ pub fn unzip(archive: &Path, dest: &Path) -> Result<()> {
         .wrap_err_with(|| format!("failed to open zip archive: {}", display_path(archive)))?
         .extract(dest)
         .wrap_err_with(|| format!("failed to extract zip archive: {}", display_path(archive)))
+}
+
+pub fn un_dmg(archive: &Path, dest: &Path) -> Result<()> {
+    debug!(
+        "hdiutil attach -quiet -nobrowse -mountpoint {} {}",
+        dest.display(),
+        archive.display()
+    );
+    let tmp = tempfile::TempDir::new()?;
+    cmd!(
+        "hdiutil",
+        "attach",
+        "-quiet",
+        "-nobrowse",
+        "-mountpoint",
+        tmp.path(),
+        archive.to_path_buf()
+    )
+    .run()?;
+    copy_dir_all(tmp.path(), dest)?;
+    cmd!("hdiutil", "detach", tmp.path()).run()?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -684,7 +719,7 @@ mod tests {
     fn test_dir_subdirs() {
         reset();
         let subdirs = dir_subdirs(&dirs::HOME).unwrap();
-        assert!(subdirs.contains(&"cwd".to_string()));
+        assert!(subdirs.contains("cwd"));
     }
 
     #[test]

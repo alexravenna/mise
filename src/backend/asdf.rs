@@ -4,9 +4,6 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{eyre, Result, WrapErr};
-use console::style;
-
 use crate::backend::backend_type::BackendType;
 use crate::backend::external_plugin_cache::ExternalPluginCache;
 use crate::backend::Backend;
@@ -22,7 +19,10 @@ use crate::plugins::Script::{Download, ExecEnv, Install, ParseLegacyFile};
 use crate::plugins::{Plugin, PluginType, Script, ScriptManager};
 use crate::toolset::{ToolRequest, ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
-use crate::{env, file};
+use crate::{dirs, env, file};
+use color_eyre::eyre::{eyre, Result, WrapErr};
+use console::style;
+use heck::ToKebabCase;
 
 /// This represents a plugin installed to ~/.local/share/mise/plugins
 pub struct AsdfBackend {
@@ -42,7 +42,8 @@ pub struct AsdfBackend {
 impl AsdfBackend {
     pub fn from_arg(ba: BackendArg) -> Self {
         let name = ba.tool_name.clone();
-        let plugin_path = ba.plugin_path.clone();
+        let plugin_path = dirs::PLUGINS.join(ba.short.to_kebab_case());
+        let plugin = AsdfPlugin::new(name.clone(), plugin_path.clone());
         let mut toml_path = plugin_path.join("mise.plugin.toml");
         if plugin_path.join("rtx.plugin.toml").exists() {
             toml_path = plugin_path.join("rtx.plugin.toml");
@@ -75,13 +76,7 @@ impl AsdfBackend {
             .with_fresh_file(plugin_path.join("bin/list-legacy-filenames"))
             .build(),
             plugin_path,
-            plugin: Box::new(AsdfPlugin::new(
-                ba.plugin_path
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
-            )),
+            plugin: Box::new(plugin),
             repo_url: None,
             toml,
             name,
@@ -119,7 +114,7 @@ impl AsdfBackend {
 
     fn fetch_bin_paths(&self, tv: &ToolVersion) -> Result<Vec<String>> {
         let list_bin_paths = self.plugin_path.join("bin/list-bin-paths");
-        let bin_paths = if matches!(tv.request, ToolRequest::System(..)) {
+        let bin_paths = if matches!(tv.request, ToolRequest::System { .. }) {
             Vec::new()
         } else if list_bin_paths.exists() {
             let sm = self.script_man_for_tv(tv)?;
@@ -184,9 +179,9 @@ impl AsdfBackend {
         let install_type = match &tv.request {
             ToolRequest::Version { .. } | ToolRequest::Prefix { .. } => "version",
             ToolRequest::Ref { .. } => "ref",
-            ToolRequest::Path(..) => "path",
+            ToolRequest::Path { .. } => "path",
             ToolRequest::Sub { .. } => "sub",
-            ToolRequest::System(..) => {
+            ToolRequest::System { .. } => {
                 panic!("should not be called for system tool")
             }
         };
@@ -232,25 +227,16 @@ impl Hash for AsdfBackend {
 }
 
 impl Backend for AsdfBackend {
-    fn ba(&self) -> &BackendArg {
-        &self.ba
-    }
-
     fn get_type(&self) -> BackendType {
         BackendType::Asdf
     }
 
-    fn get_plugin_type(&self) -> Option<PluginType> {
-        Some(PluginType::Asdf)
+    fn ba(&self) -> &BackendArg {
+        &self.ba
     }
 
-    fn get_dependencies(&self, tvr: &ToolRequest) -> Result<Vec<BackendArg>> {
-        let out = match tvr.ba().tool_name.as_str() {
-            "poetry" | "pipenv" | "pipx" => vec!["python"],
-            "elixir" => vec!["erlang"],
-            _ => vec![],
-        };
-        Ok(out.into_iter().map(|s| s.into()).collect())
+    fn get_plugin_type(&self) -> Option<PluginType> {
+        Some(PluginType::Asdf)
     }
 
     fn _list_remote_versions(&self) -> Result<Vec<String>> {
@@ -258,7 +244,7 @@ impl Backend for AsdfBackend {
             .get_or_try_init(|| self.plugin.fetch_remote_versions())
             .wrap_err_with(|| {
                 eyre!(
-                    "Failed listing remote versions for plugin {}",
+                    "Failed listing remote versions for asdf tool {}",
                     style(&self.name).blue().for_stderr(),
                 )
             })
@@ -341,8 +327,8 @@ impl Backend for AsdfBackend {
         Some(self.plugin())
     }
 
-    fn install_version_impl(&self, ctx: &InstallContext) -> Result<()> {
-        let mut sm = self.script_man_for_tv(&ctx.tv)?;
+    fn install_version_impl(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion> {
+        let mut sm = self.script_man_for_tv(&tv)?;
 
         for p in ctx.ts.list_paths() {
             sm.prepend_path(p);
@@ -351,14 +337,14 @@ impl Backend for AsdfBackend {
         let run_script = |script| sm.run_by_line(script, ctx.pr.as_ref());
 
         if sm.script_exists(&Download) {
-            ctx.pr.set_message("downloading".into());
+            ctx.pr.set_message("bin/download".into());
             run_script(&Download)?;
         }
-        ctx.pr.set_message("installing".into());
+        ctx.pr.set_message("bin/install".into());
         run_script(&Install)?;
         file::remove_dir(&self.ba.downloads_path)?;
 
-        Ok(())
+        Ok(tv)
     }
 
     fn uninstall_version_impl(&self, pr: &dyn SingleReport, tv: &ToolVersion) -> Result<()> {
@@ -384,7 +370,7 @@ impl Backend for AsdfBackend {
         ts: &Toolset,
         tv: &ToolVersion,
     ) -> eyre::Result<BTreeMap<String, String>> {
-        if matches!(tv.request, ToolRequest::System(..)) {
+        if matches!(tv.request, ToolRequest::System { .. }) {
             return Ok(BTreeMap::new());
         }
         if !self.plugin.script_man.script_exists(&ExecEnv) || *env::__MISE_SCRIPT {

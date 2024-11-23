@@ -1,12 +1,15 @@
 use crate::backend::backend_type::BackendType;
 use crate::backend::{unalias_backend, ABackend};
 use crate::config::CONFIG;
-use crate::registry::REGISTRY_BACKEND_MAP;
+use crate::plugins::PluginType;
+use crate::registry::REGISTRY;
+use crate::toolset::install_state::InstallStateTool;
 use crate::toolset::{install_state, parse_tool_options, ToolVersionOptions};
-use crate::{backend, config, dirs};
+use crate::{backend, config, dirs, registry};
 use contracts::requires;
 use eyre::{bail, Result};
 use heck::ToKebabCase;
+use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::path::PathBuf;
@@ -26,8 +29,6 @@ pub struct BackendArg {
     pub installs_path: PathBuf,
     /// ~/.local/share/mise/downloads/<THIS>
     pub downloads_path: PathBuf,
-    /// ~/.local/share/mise/plugins/<THIS>
-    pub plugin_path: PathBuf,
     pub opts: Option<ToolVersionOptions>,
     // TODO: make this not a hash key anymore to use this
     // backend: OnceCell<ABackend>,
@@ -35,15 +36,14 @@ pub struct BackendArg {
 
 impl<A: AsRef<str>> From<A> for BackendArg {
     fn from(s: A) -> Self {
-        let s = s.as_ref();
-        if let Some(ba) = REGISTRY_BACKEND_MAP
-            .get(unalias_backend(s))
-            .and_then(|rbm| rbm.first())
-        {
-            ba.clone()
-        } else {
-            Self::new(s.to_string(), None)
-        }
+        let short = unalias_backend(s.as_ref()).to_string();
+        Self::new(short, None)
+    }
+}
+
+impl From<InstallStateTool> for BackendArg {
+    fn from(ist: InstallStateTool) -> Self {
+        Self::new(ist.short, ist.full)
     }
 }
 
@@ -78,7 +78,6 @@ impl BackendArg {
             tool_name,
             short,
             full,
-            plugin_path: dirs::PLUGINS.join(&pathname),
             cache_path: dirs::CACHE.join(&pathname),
             installs_path: dirs::INSTALLS.join(&pathname),
             downloads_path: dirs::DOWNLOADS.join(&pathname),
@@ -127,19 +126,83 @@ impl BackendArg {
     }
 
     pub fn full(&self) -> String {
+        let short = unalias_backend(&self.short);
         if config::is_loaded() {
             if let Some(full) = CONFIG
                 .all_aliases
-                .get(&self.short)
+                .get(short)
                 .and_then(|a| a.backend.clone())
             {
                 return full;
             }
+            if let Some(url) = CONFIG.repo_urls.get(short) {
+                deprecated!("config_plugins", "[plugins] section of mise.toml is deprecated. Use [alias] instead. https://mise.jdx.dev/dev-tools/aliases.html");
+                return format!("asdf:{url}");
+            }
         }
         if let Some(full) = &self.full {
-            return full.clone();
+            full.clone()
+        } else if let Some(pt) = install_state::get_plugin_type(short).unwrap_or_default() {
+            match pt {
+                PluginType::Asdf => format!("asdf:{short}"),
+                PluginType::Vfox => format!("vfox:{short}"),
+            }
+        } else if let Some(full) = REGISTRY
+            .get(short)
+            .and_then(|rt| rt.backends().first().cloned())
+        {
+            full.to_string()
+        } else {
+            short.to_string()
         }
-        unalias_backend(&self.short).to_string()
+    }
+
+    pub fn opts(&self) -> ToolVersionOptions {
+        self.opts.clone().unwrap_or_else(|| {
+            if let Some(c) = regex!(r"^(.+)\[(.+)\]$").captures(&self.full()) {
+                parse_tool_options(c.get(2).unwrap().as_str())
+            } else {
+                ToolVersionOptions::default()
+            }
+        })
+    }
+
+    pub fn tool_name(&self) -> String {
+        let full = self.full();
+        let (_backend, tool_name) = full.split_once(':').unwrap_or(("", &full));
+        let tool_name = regex!(r#"\[.+\]$"#).replace_all(tool_name, "").to_string();
+        tool_name.to_string()
+    }
+
+    /// maps something like cargo:cargo-binstall to cargo-binstall and ubi:cargo-binstall, etc
+    pub fn all_fulls(&self) -> HashSet<String> {
+        let full = self.full();
+        let mut all = HashSet::new();
+        for short in registry::shorts_for_full(&full) {
+            let rt = REGISTRY.get(short).unwrap();
+            let backends = rt.backends();
+            if backends.contains(&full.as_str()) {
+                all.insert(rt.short.to_string());
+                all.extend(backends.into_iter().map(|s| s.to_string()));
+            }
+        }
+        all.insert(full);
+        all.insert(self.short.to_string());
+        all
+    }
+
+    pub fn is_os_supported(&self) -> bool {
+        if self.uses_plugin() {
+            return true;
+        }
+        if let Some(rt) = REGISTRY.get(self.short.as_str()) {
+            return rt.is_supported_os();
+        }
+        true
+    }
+
+    pub fn uses_plugin(&self) -> bool {
+        install_state::get_plugin_type(&self.short).is_ok_and(|pt| pt.is_some())
     }
 }
 
@@ -152,9 +215,9 @@ impl Display for BackendArg {
 impl Debug for BackendArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(full) = &self.full {
-            write!(f, r#"BackendArg("{}" -> "{}")"#, self.short, full)
+            write!(f, r#"BackendArg({} -> {})"#, self.short, full)
         } else {
-            write!(f, r#"BackendArg("{}")"#, self.short)
+            write!(f, r#"BackendArg({})"#, self.short)
         }
     }
 }
@@ -207,11 +270,7 @@ mod tests {
         let vfox = |s, full, name| t(s, full, name, BackendType::Vfox);
 
         asdf("asdf:poetry", "asdf:poetry", "poetry");
-        asdf(
-            "poetry",
-            "asdf:mise-plugins/mise-poetry",
-            "mise-plugins/mise-poetry",
-        );
+        asdf("poetry", "asdf:mise-plugins/mise-poetry", "poetry");
         cargo("cargo:eza", "cargo:eza", "eza");
         // core("node", "node", "node");
         npm("npm:@antfu/ni", "npm:@antfu/ni", "@antfu/ni");

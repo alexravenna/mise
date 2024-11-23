@@ -35,6 +35,9 @@ impl Doctor {
         #[cfg(unix)]
         info::inline_section("activated", yn(env::is_activated()))?;
         info::inline_section("shims_on_path", yn(shims_on_path()))?;
+        if env::is_activated() && shims_on_path() {
+            self.errors.push("shims are on PATH and mise is also activated. You should only use one of these methods.".to_string());
+        }
 
         info::section("build_info", build_info())?;
         info::section("shell", shell())?;
@@ -57,9 +60,9 @@ impl Doctor {
             ));
         }
 
-        if self.warnings.is_empty() {
-            miseprintln!("No warnings found");
-        } else {
+        miseprintln!();
+
+        if !self.warnings.is_empty() {
             let warnings_plural = if self.warnings.len() == 1 { "" } else { "s" };
             let warning_summary =
                 format!("{} warning{warnings_plural} found:", self.warnings.len());
@@ -160,6 +163,7 @@ impl Doctor {
         let tools = tools
             .into_iter()
             .map(|(t, s)| format!("{}  {s}", pad_str(&t, max_tool_len, Alignment::Left, None)))
+            .sorted()
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -219,11 +223,11 @@ fn yn(b: bool) -> String {
 
 fn mise_dirs() -> String {
     [
-        ("data", &*dirs::DATA),
-        ("config", &*dirs::CONFIG),
         ("cache", &*dirs::CACHE),
-        ("state", &*dirs::STATE),
+        ("config", &*dirs::CONFIG),
+        ("data", &*dirs::DATA),
         ("shims", &*dirs::SHIMS),
+        ("state", &*dirs::STATE),
     ]
     .iter()
     .map(|(k, p)| format!("{k}: {}", display_path(p)))
@@ -233,6 +237,7 @@ fn mise_dirs() -> String {
 fn mise_env_vars() -> String {
     let vars = env::vars()
         .filter(|(k, _)| k.starts_with("MISE_"))
+        .filter(|(k, _)| k != "MISE_GITHUB_TOKEN")
         .collect::<Vec<(String, String)>>();
     if vars.is_empty() {
         return "(none)".to_string();
@@ -251,7 +256,7 @@ fn render_config_files(config: &Config) -> String {
 
 fn render_backends() -> String {
     let mut s = vec![];
-    for b in BackendType::iter() {
+    for b in BackendType::iter().filter(|b| b != &BackendType::Unknown) {
         s.push(format!("{}", b));
     }
     s.join("\n")

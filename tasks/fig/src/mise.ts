@@ -1497,21 +1497,6 @@ const completionSpec: Fig.Spec = {
                     "options": [
                         {
                             "name": [
-                                "-c",
-                                "--core"
-                            ],
-                            "description": "The built-in plugins only\nNormally these are not shown",
-                            "isRepeatable": false
-                        },
-                        {
-                            "name": [
-                                "--user"
-                            ],
-                            "description": "List installed plugins",
-                            "isRepeatable": false
-                        },
-                        {
-                            "name": [
                                 "-u",
                                 "--urls"
                             ],
@@ -1696,6 +1681,13 @@ const completionSpec: Fig.Spec = {
                         "isOptional": false,
                         "isVariadic": false
                     }
+                },
+                {
+                    "name": [
+                        "--hide-aliased"
+                    ],
+                    "description": "Hide aliased tools",
+                    "isRepeatable": false
                 }
             ],
             "args": [
@@ -1812,9 +1804,9 @@ const completionSpec: Fig.Spec = {
                 },
                 {
                     "name": [
-                        "--timings"
+                        "--no-timings"
                     ],
-                    "description": "Shows elapsed time after each task completes",
+                    "description": "Hides elapsed time after each task completes",
                     "isRepeatable": false
                 }
             ],
@@ -1909,13 +1901,22 @@ const completionSpec: Fig.Spec = {
                         "add"
                     ],
                     "description": "Adds a setting to the configuration file",
+                    "options": [
+                        {
+                            "name": [
+                                "-l",
+                                "--local"
+                            ],
+                            "description": "Use the local config file instead of the global one",
+                            "isRepeatable": false
+                        }
+                    ],
                     "args": [
                         {
-                            "name": "setting",
+                            "name": "key",
                             "description": "The setting to set",
                             "isOptional": false,
-                            "isVariadic": false,
-                            "generators": settingsGenerator
+                            "isVariadic": false
                         },
                         {
                             "name": "value",
@@ -1930,13 +1931,22 @@ const completionSpec: Fig.Spec = {
                         "get"
                     ],
                     "description": "Show a current setting",
+                    "options": [
+                        {
+                            "name": [
+                                "-l",
+                                "--local"
+                            ],
+                            "description": "Use the local config file instead of the global one",
+                            "isRepeatable": false
+                        }
+                    ],
                     "args": [
                         {
-                            "name": "setting",
+                            "name": "key",
                             "description": "The setting to show",
                             "isOptional": false,
-                            "isVariadic": false,
-                            "generators": settingsGenerator
+                            "isVariadic": false
                         }
                     ]
                 },
@@ -1949,10 +1959,26 @@ const completionSpec: Fig.Spec = {
                     "options": [
                         {
                             "name": [
-                                "--keys"
+                                "-l",
+                                "--local"
+                            ],
+                            "description": "Use the local config file instead of the global one",
+                            "isRepeatable": false
+                        },
+                        {
+                            "name": [
+                                "--names"
                             ],
                             "description": "Only display key names for each setting",
                             "isRepeatable": false
+                        }
+                    ],
+                    "args": [
+                        {
+                            "name": "key",
+                            "description": "List keys under this key",
+                            "isOptional": true,
+                            "isVariadic": false
                         }
                     ]
                 },
@@ -1962,13 +1988,22 @@ const completionSpec: Fig.Spec = {
                         "create"
                     ],
                     "description": "Add/update a setting",
+                    "options": [
+                        {
+                            "name": [
+                                "-l",
+                                "--local"
+                            ],
+                            "description": "Use the local config file instead of the global one",
+                            "isRepeatable": false
+                        }
+                    ],
                     "args": [
                         {
-                            "name": "setting",
+                            "name": "key",
                             "description": "The setting to set",
                             "isOptional": false,
-                            "isVariadic": false,
-                            "generators": settingsGenerator
+                            "isVariadic": false
                         },
                         {
                             "name": "value",
@@ -1987,13 +2022,22 @@ const completionSpec: Fig.Spec = {
                         "del"
                     ],
                     "description": "Clears a setting",
+                    "options": [
+                        {
+                            "name": [
+                                "-l",
+                                "--local"
+                            ],
+                            "description": "Use the local config file instead of the global one",
+                            "isRepeatable": false
+                        }
+                    ],
                     "args": [
                         {
-                            "name": "setting",
+                            "name": "key",
                             "description": "The setting to remove",
                             "isOptional": false,
-                            "isVariadic": false,
-                            "generators": settingsGenerator
+                            "isVariadic": false
                         }
                     ]
                 }
@@ -2001,10 +2045,32 @@ const completionSpec: Fig.Spec = {
             "options": [
                 {
                     "name": [
-                        "--keys"
+                        "--names"
                     ],
                     "description": "Only display key names for each setting",
                     "isRepeatable": false
+                },
+                {
+                    "name": [
+                        "-l",
+                        "--local"
+                    ],
+                    "description": "Use the local config file instead of the global one",
+                    "isRepeatable": false
+                }
+            ],
+            "args": [
+                {
+                    "name": "key",
+                    "description": "Setting name to get/set",
+                    "isOptional": true,
+                    "isVariadic": false
+                },
+                {
+                    "name": "value",
+                    "description": "Setting value to set",
+                    "isOptional": true,
+                    "isVariadic": false
                 }
             ]
         },
@@ -2354,9 +2420,9 @@ const completionSpec: Fig.Spec = {
                         },
                         {
                             "name": [
-                                "--timings"
+                                "--no-timings"
                             ],
-                            "description": "Shows elapsed time after each task completes",
+                            "description": "Hides elapsed time after each task completes",
                             "isRepeatable": false
                         }
                     ],
@@ -2448,6 +2514,72 @@ const completionSpec: Fig.Spec = {
         },
         {
             "name": [
+                "tool"
+            ],
+            "description": "Gets information about a tool",
+            "options": [
+                {
+                    "name": [
+                        "-J",
+                        "--json"
+                    ],
+                    "description": "Output in JSON format",
+                    "isRepeatable": false
+                },
+                {
+                    "name": [
+                        "--backend"
+                    ],
+                    "description": "Only show backend field",
+                    "isRepeatable": false
+                },
+                {
+                    "name": [
+                        "--installed"
+                    ],
+                    "description": "Only show installed versions",
+                    "isRepeatable": false
+                },
+                {
+                    "name": [
+                        "--active"
+                    ],
+                    "description": "Only show active versions",
+                    "isRepeatable": false
+                },
+                {
+                    "name": [
+                        "--requested"
+                    ],
+                    "description": "Only show requested versions",
+                    "isRepeatable": false
+                },
+                {
+                    "name": [
+                        "--config-source"
+                    ],
+                    "description": "Only show config source",
+                    "isRepeatable": false
+                },
+                {
+                    "name": [
+                        "--tool-options"
+                    ],
+                    "description": "Only show tool options",
+                    "isRepeatable": false
+                }
+            ],
+            "args": [
+                {
+                    "name": "backend",
+                    "description": "Tool name to get information about",
+                    "isOptional": false,
+                    "isVariadic": false
+                }
+            ]
+        },
+        {
+            "name": [
                 "trust"
             ],
             "description": "Marks a config file as trusted",
@@ -2462,9 +2594,16 @@ const completionSpec: Fig.Spec = {
                 },
                 {
                     "name": [
+                        "--ignore"
+                    ],
+                    "description": "Do not trust this config and ignore it in the future",
+                    "isRepeatable": false
+                },
+                {
+                    "name": [
                         "--untrust"
                     ],
-                    "description": "No longer trust this config",
+                    "description": "No longer trust this config, will prompt in the future",
                     "isRepeatable": false
                 },
                 {

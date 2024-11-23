@@ -127,9 +127,24 @@
           "description": "should mise keep install files after installation even if the installation fails",
           "type": "boolean"
         },
-        "aqua_registry_url": {
-          "description": "URL to fetch aqua registry from.",
-          "type": "string"
+        "aqua": {
+          "additionalProperties": false,
+          "properties": {
+            "cosign": {
+              "default": true,
+              "description": "Use cosign to verify aqua tool signatures.",
+              "type": "boolean"
+            },
+            "registry_url": {
+              "description": "URL to fetch aqua registry from.",
+              "type": "string"
+            },
+            "slsa": {
+              "default": true,
+              "description": "Use SLSA to verify aqua tool signatures.",
+              "type": "boolean"
+            }
+          }
         },
         "asdf": {
           "description": "use asdf as a default plugin backend",
@@ -265,6 +280,14 @@
           "description": "Timeout in seconds for all HTTP requests in mise.",
           "type": "string"
         },
+        "ignored_config_paths": {
+          "default": [],
+          "description": "This is a list of config paths that mise will ignore.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "jobs": {
           "default": 4,
           "description": "How many jobs to run concurrently such as tool installs.",
@@ -289,7 +312,7 @@
           "type": "boolean"
         },
         "lockfile": {
-          "default": false,
+          "default": true,
           "description": "Create and read lockfiles for tool versions.",
           "type": "boolean"
         },
@@ -523,8 +546,16 @@
           "type": "string",
           "enum": ["prefix", "interleave"]
         },
+        "task_skip": {
+          "default": [],
+          "description": "Tasks to skip when running `mise run`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "task_timings": {
-          "description": "Show completion message with elapsed time for each task on `mise run`.",
+          "description": "Show completion message with elapsed time for each task on `mise run`. Default shows when output type is `prefix`.",
           "type": "boolean"
         },
         "trace": {
@@ -645,6 +676,14 @@
               },
               "type": "array"
             },
+            "wait_for": {
+              "description": "if these tasks run, wait for them to complete first",
+              "items": {
+                "description": "task to run before this task",
+                "type": "string"
+              },
+              "type": "array"
+            },
             "description": {
               "description": "description of task",
               "type": "string"
@@ -707,6 +746,22 @@
                 }
               ]
             },
+            "run_windows": {
+              "oneOf": [
+                {
+                  "description": "script to run on windows",
+                  "type": "string"
+                },
+                {
+                  "description": "script to run on windows",
+                  "items": {
+                    "description": "script to run on windows",
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ]
+            },
             "file": {
               "description": "Execute an external script",
               "type": "string"
@@ -728,6 +783,14 @@
           "type": "object"
         }
       ]
+    },
+    "vars": {
+      "description": "variables to set",
+      "type": "object",
+      "additionalProperties": {
+        "description": "value of variable",
+        "type": "string"
+      }
     },
     "task_config": {
       "description": "configration for task execution/management",
@@ -755,16 +818,35 @@
             "version": {
               "description": "version of the tool to install",
               "type": "string"
+            },
+            "os": {
+              "oneOf": [
+                {
+                  "description": "operating system to install on",
+                  "type": "array"
+                },
+                {
+                  "description": "option to pass to tool",
+                  "type": "string"
+                }
+              ]
             }
           },
           "required": ["version"],
-          "type": "object"
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "string"
+              }
+            ]
+          }
         }
       ]
     }
   },
   "additionalProperties": false,
-  "description": "config file for mise version manager (.mise.toml)",
+  "description": "config file for mise version manager (mise.toml)",
   "properties": {
     "alias": {
       "additionalProperties": {
